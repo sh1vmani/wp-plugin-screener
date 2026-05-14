@@ -526,24 +526,49 @@ elif cmd == "score":
     if days_since_patch >= 180 and days_since_patch <= 730:
         score += 5; reasons.append(("+5", f"last update {days_since_patch}d ago (stale but in scope)"))
 
-    # Screener-derived scoring. First-party HIGH count signals real
-    # attack surface; vendored code is already excluded by the screener.
-    sh_high = int(rec.get("screener_high") or 0)
-    sh_med  = int(rec.get("screener_medium") or 0)
+    # Screener-derived scoring. Wordfence-eligible scope is NOPRIV +
+    # SUBSCRIBER + AUTHOR (Editor / Admin / Super Admin are out of scope).
+    # Use IN-SCOPE counts for rewards; raw totals don't matter if the
+    # surface is admin-only. UNKNOWN bucket is conservatively included as
+    # in-scope until the classifier improves.
+    #
+    # Back-compat: if SCREENER_AUTHBAND_HIGH lines weren't emitted (older
+    # screener), screener_inscope_high will be 0 and we fall back to the
+    # raw total via the second branch.
+    sh_high       = int(rec.get("screener_high") or 0)
+    sh_med        = int(rec.get("screener_medium") or 0)
+    in_scope_high = int(rec.get("screener_inscope_high") or 0)
+    in_scope_med  = int(rec.get("screener_inscope_med") or 0)
+    oos_high      = int(rec.get("screener_oos_high") or 0)
+    oos_med       = int(rec.get("screener_oos_med") or 0)
+    verdict       = rec.get("screener_verdict") or ""
 
-    if sh_high >= 50:
-        score += 6;  reasons.append(("+6",  f"screener: {sh_high} first-party HIGH (rich attack surface)"))
-    elif sh_high >= 20:
-        score += 4;  reasons.append(("+4",  f"screener: {sh_high} first-party HIGH"))
-    elif sh_high >= 10:
-        score += 2;  reasons.append(("+2",  f"screener: {sh_high} first-party HIGH"))
-    elif sh_high >= 3:
-        score += 1;  reasons.append(("+1",  f"screener: {sh_high} first-party HIGH (modest)"))
-    elif sh_high == 0 and sh_med < 3:
-        score -= 3;  reasons.append(("-3",  "screener: hardened (no first-party HIGH)"))
+    # Use in_scope when we have authband data; otherwise fall back to raw.
+    eff_high = in_scope_high if (in_scope_high + oos_high) > 0 else sh_high
+    eff_med  = in_scope_med  if (in_scope_med  + oos_med ) > 0 else sh_med
 
-    if sh_med >= 5:
-        score += 1;  reasons.append(("+1",  f"screener: {sh_med} MEDIUM (broad surface)"))
+    if eff_high >= 50:
+        score += 6;  reasons.append(("+6",  f"screener: {eff_high} in-scope HIGH (rich attack surface)"))
+    elif eff_high >= 20:
+        score += 4;  reasons.append(("+4",  f"screener: {eff_high} in-scope HIGH"))
+    elif eff_high >= 10:
+        score += 2;  reasons.append(("+2",  f"screener: {eff_high} in-scope HIGH"))
+    elif eff_high >= 3:
+        score += 1;  reasons.append(("+1",  f"screener: {eff_high} in-scope HIGH (modest)"))
+    elif eff_high == 0 and eff_med < 3:
+        score -= 3;  reasons.append(("-3",  "screener: hardened (no in-scope HIGH)"))
+
+    if eff_med >= 5:
+        score += 1;  reasons.append(("+1",  f"screener: {eff_med} in-scope MEDIUM (broad surface)"))
+
+    # Strong demote when the plugin is OOS-ONLY: the screener flagged HIGHs
+    # but they all bottom out at Editor/Admin caps. Wordfence won't pay for
+    # those — push the plugin to the bottom of the ranking.
+    if verdict == "OOS-ONLY":
+        score -= 12; reasons.append(("-12", f"screener: OOS-ONLY ({oos_high} HIGH all Editor/Admin-gated)"))
+    elif oos_high >= 10 and in_scope_high == 0:
+        # Defensive — verdict label was missing but the pattern still applies.
+        score -= 10; reasons.append(("-10", f"screener: {oos_high} HIGH all out-of-scope (no NOPRIV/SUBSCRIBER/AUTHOR surface)"))
 
     rec["cves_dedup"]        = cves
     rec["cves_recent_count"] = n_12mo
@@ -607,7 +632,18 @@ elif cmd == "render_top":
 
         sc = screener.get(slug)
         if sc:
-            print(f"      screener: {sc.get('verdict','?')}   HIGH={sc.get('high','?')}  MEDIUM={sc.get('med','?')}")
+            v = sc.get('verdict','?')
+            hi = sc.get('high','?'); md = sc.get('med','?')
+            # In-scope = NOPRIV + SUBSCRIBER + AUTHOR + UNKNOWN (Wordfence-eligible).
+            # OOS = EDITOR + ADMIN (skip).
+            in_h = (sc.get('ah_nopriv',0) + sc.get('ah_subscriber',0)
+                    + sc.get('ah_author',0) + sc.get('ah_unknown',0))
+            oos_h = sc.get('ah_editor',0) + sc.get('ah_admin',0)
+            if (in_h + oos_h) > 0:
+                print(f"      screener: {v}   HIGH={hi}  MEDIUM={md}   in-scope-H={in_h}  OOS-H={oos_h}")
+                print(f"      auth bands (HIGH):  NOPRIV={sc.get('ah_nopriv',0)}  SUB={sc.get('ah_subscriber',0)}  AUTHOR={sc.get('ah_author',0)}  EDITOR={sc.get('ah_editor',0)}  ADMIN={sc.get('ah_admin',0)}  UNKNOWN={sc.get('ah_unknown',0)}")
+            else:
+                print(f"      screener: {v}   HIGH={hi}  MEDIUM={md}")
         else:
             print(f"      screener: not run")
 
@@ -1018,6 +1054,11 @@ print("no")
     screener_high=0
     screener_medium=0
     screener_low=0
+    screener_verdict=""
+    # Auth-band counts (set if SCREENER_AUTHBAND_* lines present). Default
+    # to 0 so the python json injection always sees a value.
+    ah_nopriv=0; ah_sub=0; ah_author=0; ah_editor=0; ah_admin=0; ah_unknown=0
+    am_nopriv=0; am_sub=0; am_author=0; am_editor=0; am_admin=0; am_unknown=0
 
     if [ "$NO_SCREENER" != "1" ] && [ -x "$SCREENER" ]; then
         slug_for_screen=$(echo "$scored" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("slug",""))')
@@ -1040,6 +1081,26 @@ print("no")
                     screener_high=$(echo "$summary_line"   | awk -F'\t' '{print $2}')
                     screener_medium=$(echo "$summary_line" | awk -F'\t' '{print $3}')
                     screener_low=$(echo "$summary_line"    | awk -F'\t' '{print $4}')
+                    screener_verdict=$(echo "$summary_line" | awk -F'\t' '{print $5}')
+                fi
+                # SCREENER_AUTHBAND_HIGH/MED<TAB>nopriv<TAB>sub<TAB>author<TAB>editor<TAB>admin<TAB>unknown
+                ah_line=$(echo "$screener_out" | grep '^SCREENER_AUTHBAND_HIGH' | head -1)
+                if [ -n "$ah_line" ]; then
+                    ah_nopriv=$(echo "$ah_line" | awk -F'\t' '{print $2}')
+                    ah_sub=$(echo "$ah_line"    | awk -F'\t' '{print $3}')
+                    ah_author=$(echo "$ah_line" | awk -F'\t' '{print $4}')
+                    ah_editor=$(echo "$ah_line" | awk -F'\t' '{print $5}')
+                    ah_admin=$(echo "$ah_line"  | awk -F'\t' '{print $6}')
+                    ah_unknown=$(echo "$ah_line" | awk -F'\t' '{print $7}')
+                fi
+                am_line=$(echo "$screener_out" | grep '^SCREENER_AUTHBAND_MED' | head -1)
+                if [ -n "$am_line" ]; then
+                    am_nopriv=$(echo "$am_line" | awk -F'\t' '{print $2}')
+                    am_sub=$(echo "$am_line"    | awk -F'\t' '{print $3}')
+                    am_author=$(echo "$am_line" | awk -F'\t' '{print $4}')
+                    am_editor=$(echo "$am_line" | awk -F'\t' '{print $5}')
+                    am_admin=$(echo "$am_line"  | awk -F'\t' '{print $6}')
+                    am_unknown=$(echo "$am_line" | awk -F'\t' '{print $7}')
                 fi
             fi
         fi
@@ -1051,9 +1112,36 @@ print("no")
     scored=$(echo "$scored" | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
-r['screener_high']   = int('$screener_high' or 0)
-r['screener_medium'] = int('$screener_medium' or 0)
-r['screener_low']    = int('$screener_low' or 0)
+r['screener_high']    = int('$screener_high' or 0)
+r['screener_medium']  = int('$screener_medium' or 0)
+r['screener_low']     = int('$screener_low' or 0)
+r['screener_verdict'] = '$screener_verdict' or ''
+# Per-band auth counters from SCREENER_AUTHBAND_HIGH / _MED. Allow blanks for
+# back-compat with older screener output that didn't emit these lines.
+r['screener_authband_high'] = {
+    'nopriv':     int('${ah_nopriv:-0}'    or 0),
+    'subscriber': int('${ah_sub:-0}'       or 0),
+    'author':     int('${ah_author:-0}'    or 0),
+    'editor':     int('${ah_editor:-0}'    or 0),
+    'admin':      int('${ah_admin:-0}'     or 0),
+    'unknown':    int('${ah_unknown:-0}'   or 0),
+}
+r['screener_authband_med'] = {
+    'nopriv':     int('${am_nopriv:-0}'    or 0),
+    'subscriber': int('${am_sub:-0}'       or 0),
+    'author':     int('${am_author:-0}'    or 0),
+    'editor':     int('${am_editor:-0}'    or 0),
+    'admin':      int('${am_admin:-0}'     or 0),
+    'unknown':    int('${am_unknown:-0}'   or 0),
+}
+# Wordfence-eligible scope: NOPRIV + SUBSCRIBER + AUTHOR (Editor+ is OOS).
+# UNKNOWN is conservatively kept in-scope until classification improves.
+ah = r['screener_authband_high']
+am = r['screener_authband_med']
+r['screener_inscope_high'] = ah['nopriv'] + ah['subscriber'] + ah['author'] + ah['unknown']
+r['screener_inscope_med']  = am['nopriv'] + am['subscriber'] + am['author'] + am['unknown']
+r['screener_oos_high']     = ah['editor'] + ah['admin']
+r['screener_oos_med']      = am['editor'] + am['admin']
 print(json.dumps(r))
 ")
     scored=$(echo "$scored" | py score)
@@ -1184,14 +1272,48 @@ else
         verdict=$(echo "$clean" | grep -E '^Overall:' | tail -1 | awk -F': ' '{print $2}')
         highs=$(echo "$clean" | grep -oE 'HIGH:[[:space:]]+[0-9]+' | tail -1 | grep -oE '[0-9]+')
         meds=$(echo  "$clean" | grep -oE 'MEDIUM:[[:space:]]+[0-9]+' | tail -1 | grep -oE '[0-9]+')
+        # Auth-band breakdown from SCREENER_AUTHBAND_HIGH (tab-separated).
+        ab_h=$(echo "$out" | grep '^SCREENER_AUTHBAND_HIGH' | head -1)
+        ab_m=$(echo "$out" | grep '^SCREENER_AUTHBAND_MED'  | head -1)
+        if [ -n "$ab_h" ]; then
+            ah_n=$(echo "$ab_h" | awk -F'\t' '{print $2}')   # NOPRIV
+            ah_s=$(echo "$ab_h" | awk -F'\t' '{print $3}')   # SUBSCRIBER
+            ah_a=$(echo "$ab_h" | awk -F'\t' '{print $4}')   # AUTHOR
+            ah_e=$(echo "$ab_h" | awk -F'\t' '{print $5}')   # EDITOR
+            ah_d=$(echo "$ab_h" | awk -F'\t' '{print $6}')   # ADMIN
+            ah_u=$(echo "$ab_h" | awk -F'\t' '{print $7}')   # UNKNOWN
+        else
+            ah_n=0; ah_s=0; ah_a=0; ah_e=0; ah_d=0; ah_u=0
+        fi
+        if [ -n "$ab_m" ]; then
+            am_n=$(echo "$ab_m" | awk -F'\t' '{print $2}')
+            am_s=$(echo "$ab_m" | awk -F'\t' '{print $3}')
+            am_a=$(echo "$ab_m" | awk -F'\t' '{print $4}')
+            am_e=$(echo "$ab_m" | awk -F'\t' '{print $5}')
+            am_d=$(echo "$ab_m" | awk -F'\t' '{print $6}')
+            am_u=$(echo "$ab_m" | awk -F'\t' '{print $7}')
+        else
+            am_n=0; am_s=0; am_a=0; am_e=0; am_d=0; am_u=0
+        fi
         verdict="${verdict:-UNKNOWN}"
-        say "    -> $verdict  HIGH=${highs:-0} MEDIUM=${meds:-0}"
+        say "    -> $verdict  HIGH=${highs:-0} MEDIUM=${meds:-0}  (NOPRIV-H=$ah_n  ADMIN-H=$ah_d)"
         SLUG="$slug" V="$verdict" H="${highs:-0}" M="${meds:-0}" \
+        AHN="$ah_n" AHS="$ah_s" AHA="$ah_a" AHE="$ah_e" AHD="$ah_d" AHU="$ah_u" \
+        AMN="$am_n" AMS="$am_s" AMA="$am_a" AME="$am_e" AMD="$am_d" AMU="$am_u" \
             python3 -c '
 import os, json
 p = "'"$SCREENER_JSON"'"
 d = json.load(open(p))
-d[os.environ["SLUG"]] = {"verdict": os.environ["V"], "high": int(os.environ["H"]), "med": int(os.environ["M"])}
+def i(k): return int(os.environ.get(k) or 0)
+d[os.environ["SLUG"]] = {
+    "verdict":  os.environ["V"],
+    "high":     int(os.environ["H"]),
+    "med":      int(os.environ["M"]),
+    "ah_nopriv":i("AHN"), "ah_subscriber":i("AHS"), "ah_author":i("AHA"),
+    "ah_editor":i("AHE"), "ah_admin":    i("AHD"),  "ah_unknown":i("AHU"),
+    "am_nopriv":i("AMN"), "am_subscriber":i("AMS"), "am_author":i("AMA"),
+    "am_editor":i("AME"), "am_admin":    i("AMD"),  "am_unknown":i("AMU"),
+}
 json.dump(d, open(p,"w"))
 '
     done

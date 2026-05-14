@@ -25,10 +25,11 @@ Answers "which plugin should I audit next?"
 
 - Seeds from wp.org's `query_plugins` API across three browse modes (popular / updated / new) for a diverse seed pool.
 - Enriches each candidate slug with CVE data joined from WPScan, Patchstack, Wordfence Intelligence, and NVD. Tokens optional; NVD always on.
-- Scores candidates on install-size sweet spot, CVE recency pattern, recurring vuln-type, vague-changelog signals (indicates silent patches), screener HIGH-count, and update staleness.
+- Scores candidates on install-size sweet spot, CVE recency pattern, recurring vuln-type, vague-changelog signals (indicates silent patches), **in-scope screener HIGH-count** (NOPRIV + SUBSCRIBER + AUTHOR — Editor/Admin findings are penalised, not rewarded, because Wordfence treats them as out of scope), and update staleness.
 - Picks the highest-scoring plugin in each of three install buckets (100K–399K, 400K–999K, 1M+) so the output spreads across plugin sizes instead of clustering on the mega-popular.
 - Dedups against a personal audit history and an explicit "already audited" list.
 - Caches everything for 6h. Optional `--cache-only` mode for offline runs.
+- Per-plugin output shows the auth-band breakdown so you can see at a glance whether a HIGH count is real attack surface or admin-only noise.
 
 ### `wp-plugin-screener.sh` — the screener
 

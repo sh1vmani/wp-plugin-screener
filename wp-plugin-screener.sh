@@ -803,6 +803,130 @@ scan_pattern_php MEDIUM "wp_ajax_nopriv handler" \
 scan_pattern_php HIGH "file write / upload" \
     "(^|[^[:alnum:]_])(move_uploaded_file|file_put_contents)[[:space:]]*\("
 
+# 11. superglobal-as-path-component — path-traversal pattern (CWE-22).
+# Two-rule pair:
+#   11a (this block, same-line) — sink call where the superglobal is in the
+#       argument list of the sink directly. Highest precision, lowest recall.
+#   11b (block below) — sink call takes a variable; the variable traces back
+#       through up to two assignment hops within the same function to a
+#       superglobal read. Catches the indirect form seen in Pirate Forms
+#       (line 1245-46: `$dir_new = ...$form_id...` / `wp_mkdir_p($dir_new)`).
+#
+# This pattern matches the Pirate Forms 2.6.1 finding
+# (public/class-pirateforms-public.php:1245-46) and Forminator CVE-2025-6463
+# (file deletion via entry-id from $_POST).
+#
+# Higher confidence than Rule 5: Rule 5 just says "there's a file write
+# anywhere in the file"; Rule 11 says "the write argument contains
+# attacker-controlled input on the SAME LINE."
+#
+# Sinks covered (write + delete + dir-create + symlink):
+#   wp_mkdir_p, mkdir, move_uploaded_file, file_put_contents, fopen, copy,
+#   rename, symlink, link, unlink, wp_delete_file
+#
+# Inline sanitizer skip: if the superglobal is wrapped by sanitize_file_name /
+# realpath / absint / wp_unique_filename / basename on the same line, skip —
+# those are the canonical safe wrappers for path inputs.
+if [ -n "$PHP_FILES" ]; then
+    sink_re='(wp_mkdir_p|mkdir|move_uploaded_file|file_put_contents|fopen|copy|rename|symlink|link|unlink|wp_delete_file)[[:space:]]*\([^)]*\$_(GET|POST|REQUEST)'
+    safe_re='sanitize_file_name|wp_unique_filename|realpath|absint|intval|\(int\)|basename'
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        # Same-line sanitizer wrap — drop if any standard path-safe wrapper
+        # is present on the same line (regardless of position; we don't
+        # need to verify the wrapper is around the superglobal specifically,
+        # since false positives on path sinks are cheaper than misses).
+        if echo "$content" | grep -qE "$safe_re"; then
+            continue
+        fi
+        add_finding HIGH "superglobal in path/file sink" "$file:$lineno" "$content"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "$sink_re" 2>/dev/null || true)
+fi
+
+# 11b. path/file sink takes a variable that traces back to a superglobal via
+# 1-2 assignment hops within the same enclosing function. Uses the function
+# span cache built by _populate_file_cache so we don't re-walk the file.
+#
+# Examples it catches (and the bug class):
+#   Pirate Forms 2.6.1, public/class-pirateforms-public.php:1245-46
+#     $form_id  = $_POST['pirate_forms_form_id'];   // upstream (somewhere in same fn)
+#     $dir_new  = $this->...( "saved/$form_id" );   // 1-hop var
+#     wp_mkdir_p( $dir_new );                       // sink — Rule 11b fires HERE
+#   Forminator <= 1.44.2, entry deletion: same shape, deletion side.
+#
+# Bounded to 2 hops to keep cost predictable. Real flow analysis is v0.2.
+if [ -n "$PHP_FILES" ]; then
+    # Sink call whose FIRST argument is a $variable (not a superglobal directly —
+    # 11a above already handles that case). Capture both the sink name and the
+    # variable name so the trace can start.
+    sink_var_re='(wp_mkdir_p|mkdir|move_uploaded_file|file_put_contents|fopen|copy|rename|symlink|link|unlink|wp_delete_file)[[:space:]]*\([[:space:]]*\$([a-zA-Z_][a-zA-Z0-9_]+)'
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+
+        # Skip if 11a would have already fired (sink line contains a superglobal directly).
+        if echo "$content" | grep -qE '\$_(GET|POST|REQUEST)'; then continue; fi
+
+        # Extract the variable name passed as the first arg. Take the first
+        # $var on the line that follows a known sink — there can be more
+        # than one sink-shaped match in the line, but the first is reliable.
+        var=$(echo "$content" | grep -oE "$sink_var_re" | head -1 | sed -E 's/.*\$([a-zA-Z_][a-zA-Z0-9_]+).*/\1/')
+        [ -z "$var" ] && continue
+
+        # Find enclosing function span from the cache.
+        _populate_file_cache "$file"
+        func_start=0; func_end=0
+        while IFS= read -r rec; do
+            [ -z "$rec" ] && continue
+            IFS='|' read -r _tag _s _e _ _ _ <<< "$rec"
+            if [ "$lineno" -ge "$_s" ] && [ "$lineno" -le "$_e" ]; then
+                func_start="$_s"; func_end="$_e"
+                break
+            fi
+        done <<< "${FILE_FUNC_DATA[$file]}"
+        [ "$func_start" = "0" ] && continue
+
+        # Slice the function body once for both hops.
+        body=$(sed -n "${func_start},${func_end}p" "$file" 2>/dev/null)
+
+        # 1-hop: $var = ... $_POST/$_GET/$_REQUEST ... on a single line within
+        # the function body.
+        if echo "$body" | grep -qE "\\\$${var}[[:space:]]*=[^;]*\\\$_(GET|POST|REQUEST)"; then
+            add_finding HIGH "path/file sink <- superglobal (1-hop)" "$file:$lineno" "$content"
+            continue
+        fi
+
+        # 2-hop: $var = ... $other_var ...   and   $other_var = ... $_POST ...
+        # Pull the assignment line for $var, extract any other variable names
+        # in its RHS, and check each for an upstream superglobal assignment in
+        # the same function body.
+        var_assign=$(echo "$body" | grep -E "^\s*\\\$${var}[[:space:]]*=" | head -1)
+        [ -z "$var_assign" ] && continue
+        # Strip the LHS so we don't include $var itself.
+        rhs=$(echo "$var_assign" | sed -E "s/^\s*\\\$${var}[[:space:]]*=//")
+        other_vars=$(echo "$rhs" | grep -oE '\$[a-zA-Z_][a-zA-Z0-9_]+' | sed 's/^\$//' | sort -u | grep -vE "^(${var}|this)$")
+        [ -z "$other_vars" ] && continue
+        hit=""
+        while IFS= read -r ov; do
+            [ -z "$ov" ] && continue
+            if echo "$body" | grep -qE "\\\$${ov}[[:space:]]*=[^;]*\\\$_(GET|POST|REQUEST)"; then
+                hit="$ov"
+                break
+            fi
+        done <<< "$other_vars"
+        if [ -n "$hit" ]; then
+            add_finding HIGH "path/file sink <- superglobal (2-hop via \$$hit)" "$file:$lineno" "$content"
+        fi
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "$sink_var_re" 2>/dev/null || true)
+fi
+
 # 6. wp_localize_script / wp_add_inline_script with secrets — multi-line aware.
 # For each call, scan up to 25 lines ahead for a secret-ish key.
 if [ -n "$PHP_FILES" ]; then

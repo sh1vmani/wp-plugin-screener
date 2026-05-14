@@ -56,23 +56,34 @@ def resolve_source(slug):
 
 
 # Parse screener output. Lines look like:
-#   [HIGH] unsanitized superglobal             includes/admin/ajax.php:486
+#   [HIGH] [NOPRIV] unsanitized superglobal     includes/admin/ajax.php:486
 #        $data = json_decode(stripslashes($_POST['data']), true);
+#
+# The second bracketed token is the auth-band tag added in v7+. Older output
+# without the tag is still supported (the tag group is optional).
 FINDING_RE = re.compile(
-    r"^\s*\[(HIGH|MEDIUM|LOW)\]\s+(.+?)\s{2,}(\S+):(\d+)\s*$"
+    r"^\s*\[(HIGH|MEDIUM|LOW)\]"
+    r"(?:\s+\[(NOPRIV|SUBSCRIBER|AUTHOR|EDITOR|ADMIN|UNKNOWN)\])?"
+    r"\s+(.+?)\s{2,}(\S+):(\d+)\s*$"
 )
 SUMMARY_RE = re.compile(r"^SCREENER_SUMMARY\t(\d+)\t(\d+)\t(\d+)\t(\S+)")
+# v7+ auth-band counts: NOPRIV / SUBSCRIBER / AUTHOR / EDITOR / ADMIN / UNKNOWN.
+AUTHBAND_HIGH_RE = re.compile(r"^SCREENER_AUTHBAND_HIGH\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)")
+AUTHBAND_MED_RE = re.compile(r"^SCREENER_AUTHBAND_MED\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)")
 
 
 def parse_screener_output(text):
     findings = []
     summary = None
+    authband_high = None
+    authband_med = None
     for line in text.splitlines():
         m = FINDING_RE.match(line)
         if m:
-            sev, cat, file_, lineno = m.groups()
+            sev, band, cat, file_, lineno = m.groups()
             findings.append({
                 "sev": sev,
+                "band": band or "UNKNOWN",
                 "category": cat.strip(),
                 "file": file_,
                 "line": int(lineno),
@@ -86,6 +97,33 @@ def parse_screener_output(text):
                 "low": int(m.group(3)),
                 "verdict": m.group(4),
             }
+            continue
+        m = AUTHBAND_HIGH_RE.match(line)
+        if m:
+            authband_high = {
+                "nopriv": int(m.group(1)),
+                "subscriber": int(m.group(2)),
+                "author": int(m.group(3)),
+                "editor": int(m.group(4)),
+                "admin": int(m.group(5)),
+                "unknown": int(m.group(6)),
+            }
+            continue
+        m = AUTHBAND_MED_RE.match(line)
+        if m:
+            authband_med = {
+                "nopriv": int(m.group(1)),
+                "subscriber": int(m.group(2)),
+                "author": int(m.group(3)),
+                "editor": int(m.group(4)),
+                "admin": int(m.group(5)),
+                "unknown": int(m.group(6)),
+            }
+            continue
+    # Attach the band breakdown to the summary so per-plugin results carry it.
+    if summary is not None:
+        summary["authband_high"] = authband_high
+        summary["authband_med"] = authband_med
     return findings, summary
 
 

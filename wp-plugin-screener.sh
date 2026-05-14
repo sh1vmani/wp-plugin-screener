@@ -17,13 +17,172 @@ MED_COUNT=0
 LOW_COUNT=0
 FINDINGS=()
 
+# Auth-band counters (in-scope findings, per band).
+declare -A HIGH_BY_BAND=(
+    [NOPRIV]=0
+    [SUBSCRIBER]=0
+    [AUTHOR]=0
+    [EDITOR]=0
+    [ADMIN]=0
+    [UNKNOWN]=0
+)
+declare -A MED_BY_BAND=(
+    [NOPRIV]=0
+    [SUBSCRIBER]=0
+    [AUTHOR]=0
+    [EDITOR]=0
+    [ADMIN]=0
+    [UNKNOWN]=0
+)
+# Out-of-scope counters: findings filtered out because their auth band is
+# above MAX_AUTH. Tracked separately so the user can see how much they're
+# dropping vs. what's left.
+AUTH_OOS_HIGH=0
+AUTH_OOS_MED=0
+AUTH_OOS_LOW=0
+
+# Auth-band ordering for filter comparisons. Lower index = more reachable.
+declare -A BAND_RANK=(
+    [NOPRIV]=0
+    [SUBSCRIBER]=1
+    [AUTHOR]=2
+    [EDITOR]=3
+    [ADMIN]=4
+    [UNKNOWN]=99   # treat unknown above everything by default; --auth-untagged-show overrides display, not rank
+)
+
+# Default MAX_AUTH if not set by CLI yet (defensive — set -u tolerant).
+# CLI parsing below will overwrite, then we recompute MAX_AUTH_RANK there.
+MAX_AUTH="${MAX_AUTH:-all}"
+MAX_AUTH_RANK=99
+
+# Standard WordPress capability → auth-band table. Lookups against the
+# capability literal inside `current_user_can('X')` calls. Plugin-defined
+# custom caps are discovered at run time by the CAP_DISCOVERY pre-pass below.
+#
+# Banding rule: choose the SHALLOWEST default role that has the cap on a
+# vanilla single-site install. WP standard caps as of WP 6.7. Bands above
+# AUTHOR are "Wordfence out of scope" per the bounty rules.
+declare -A STD_CAP_BAND=(
+    # Subscriber
+    [read]=SUBSCRIBER
+    # Contributor / Author (we collapse both into AUTHOR band — "mid-level")
+    [edit_posts]=AUTHOR
+    [delete_posts]=AUTHOR
+    [publish_posts]=AUTHOR
+    [upload_files]=AUTHOR
+    [edit_published_posts]=AUTHOR
+    [delete_published_posts]=AUTHOR
+    # Editor (out of scope for Wordfence)
+    [edit_others_posts]=EDITOR
+    [delete_others_posts]=EDITOR
+    [edit_pages]=EDITOR
+    [publish_pages]=EDITOR
+    [delete_pages]=EDITOR
+    [edit_others_pages]=EDITOR
+    [delete_others_pages]=EDITOR
+    [edit_published_pages]=EDITOR
+    [delete_published_pages]=EDITOR
+    [read_private_posts]=EDITOR
+    [read_private_pages]=EDITOR
+    [manage_categories]=EDITOR
+    [manage_links]=EDITOR
+    [moderate_comments]=EDITOR
+    [unfiltered_html]=EDITOR
+    # Administrator (out of scope)
+    [activate_plugins]=ADMIN
+    [delete_plugins]=ADMIN
+    [edit_plugins]=ADMIN
+    [install_plugins]=ADMIN
+    [update_plugins]=ADMIN
+    [delete_themes]=ADMIN
+    [edit_themes]=ADMIN
+    [install_themes]=ADMIN
+    [update_themes]=ADMIN
+    [switch_themes]=ADMIN
+    [edit_users]=ADMIN
+    [delete_users]=ADMIN
+    [create_users]=ADMIN
+    [list_users]=ADMIN
+    [promote_users]=ADMIN
+    [add_users]=ADMIN
+    [remove_users]=ADMIN
+    [manage_options]=ADMIN
+    [edit_dashboard]=ADMIN
+    [import]=ADMIN
+    [export]=ADMIN
+    [update_core]=ADMIN
+    [edit_files]=ADMIN
+    # Super Admin (multisite) — also ADMIN band for our purposes
+    [manage_network]=ADMIN
+    [manage_sites]=ADMIN
+    [manage_network_users]=ADMIN
+    [manage_network_plugins]=ADMIN
+    [manage_network_themes]=ADMIN
+    [manage_network_options]=ADMIN
+    [upgrade_network]=ADMIN
+    [setup_network]=ADMIN
+    # WooCommerce / common ecommerce — ADMIN band
+    [manage_woocommerce]=ADMIN
+    [view_woocommerce_reports]=ADMIN
+    [edit_shop_orders]=ADMIN
+    [edit_others_shop_orders]=ADMIN
+    [edit_product]=ADMIN
+    [edit_products]=ADMIN
+)
+
+# Plugin-defined custom caps: populated by CAP_DISCOVERY pre-pass.
+declare -A CUSTOM_CAP_BAND=()
+
 usage() {
-    echo "Usage: $0 <plugin.zip|plugin-directory>" >&2
+    cat >&2 <<EOF
+Usage: $0 [--max-auth=<band>] [--auth-untagged-show] <plugin.zip|plugin-directory>
+
+  --max-auth=<band>         Filter findings reachable only by auth bands ABOVE
+                            the given level. Use this to focus on Wordfence-
+                            bountyable findings (Editor+/Admin are out of scope).
+                            Bands (lower = more reachable):
+                              nopriv         (unauthenticated)
+                              subscriber     (Subscriber / Customer / Student)
+                              author         (Contributor / Author)        [default]
+                              editor         (Editor)
+                              admin          (Administrator / Shop Manager / Super Admin)
+                              all            (no filtering — tag only)
+                            Findings AT or BELOW the band are kept; ABOVE are
+                            counted as auth-out-of-scope in the summary.
+  --auth-untagged-show      When --max-auth is set, also show findings whose
+                            auth band could not be classified (default: hide).
+
+EOF
     exit 1
 }
 
-[ $# -lt 1 ] && usage
-INPUT="$1"
+# CLI parsing
+MAX_AUTH="all"
+AUTH_UNTAGGED_SHOW=0
+INPUT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --max-auth=*)        MAX_AUTH="${1#--max-auth=}" ;;
+        --max-auth)          shift; MAX_AUTH="${1:-}" ;;
+        --auth-untagged-show) AUTH_UNTAGGED_SHOW=1 ;;
+        -h|--help)           usage ;;
+        --)                  shift; break ;;
+        --*)                 echo "Unknown option: $1" >&2; usage ;;
+        *)                   INPUT="$1" ;;
+    esac
+    shift
+done
+case "$MAX_AUTH" in
+    nopriv)     MAX_AUTH_RANK=0 ;;
+    subscriber) MAX_AUTH_RANK=1 ;;
+    author)     MAX_AUTH_RANK=2 ;;
+    editor)     MAX_AUTH_RANK=3 ;;
+    admin)      MAX_AUTH_RANK=4 ;;
+    all)        MAX_AUTH_RANK=99 ;;
+    *) echo "Invalid --max-auth: $MAX_AUTH" >&2; usage ;;
+esac
+[ -z "$INPUT" ] && usage
 [ ! -e "$INPUT" ] && { echo "Input not found: $INPUT" >&2; exit 1; }
 
 OUT_DIR="$HOME/screener-results"
@@ -99,6 +258,7 @@ if [ "$EXCLUDE_VENDORED" = "1" ]; then
     PHP_FILES=$(find "$TARGET_DIR" -type f -name '*.php' \
                   -not -path '*/vendor/*' \
                   -not -path '*/vendor-prod/*' \
+                  -not -path '*/vendor_prefixed/*' \
                   -not -path '*/node_modules/*' \
                   -not -path '*/dist/*' \
                   -not -path '*/build/*' \
@@ -106,16 +266,17 @@ if [ "$EXCLUDE_VENDORED" = "1" ]; then
     JS_FILES=$(find "$TARGET_DIR" -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.vue' \) \
                   -not -path '*/vendor/*' \
                   -not -path '*/vendor-prod/*' \
+                  -not -path '*/vendor_prefixed/*' \
                   -not -path '*/node_modules/*' \
                   -not -path '*/dist/*' \
                   -not -path '*/build/*' \
                   -not -name '*.min.js' \
                   2>/dev/null)
     PHP_VENDOR_FILES=$(find "$TARGET_DIR" -type f -name '*.php' \
-                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/dist/*' -o -path '*/build/*' \) \
+                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/vendor_prefixed/*' -o -path '*/dist/*' -o -path '*/build/*' \) \
                   2>/dev/null)
     JS_VENDOR_FILES=$(find "$TARGET_DIR" -type f \( -name '*.js' -o -name '*.jsx' \) \
-                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/dist/*' -o -path '*/build/*' -o -name '*.min.js' \) \
+                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/vendor_prefixed/*' -o -path '*/dist/*' -o -path '*/build/*' -o -name '*.min.js' \) \
                   2>/dev/null)
 else
     PHP_FILES=$(find "$TARGET_DIR" -type f -name '*.php' 2>/dev/null)
@@ -163,9 +324,25 @@ fi
 
 SUPPRESSED_COUNT=0
 
-# add_finding <severity> <category> <file:line> <evidence>
+# Color helper for auth-band tag display.
+band_color() {
+    case "$1" in
+        NOPRIV)     echo "$RED" ;;       # bright red — best/worst, best yield
+        SUBSCRIBER) echo "$YEL" ;;       # yellow — low auth
+        AUTHOR)     echo "$YEL" ;;       # yellow — mid auth
+        EDITOR)     echo "$CYA" ;;       # dim — out of scope
+        ADMIN)      echo "$CYA" ;;       # dim — out of scope
+        *)          echo "$CYA" ;;       # unknown
+    esac
+}
+
+# add_finding <severity> <category> <file:line> <evidence> [band]
+# If the optional 5th arg (band) is omitted, classify_auth_band is called on
+# the location. If --max-auth was set on the CLI, findings whose band ranks
+# above MAX_AUTH are NOT printed (counted as AUTH_OOS_*) so the user can focus
+# on Wordfence-bountyable findings.
 add_finding() {
-    local sev="$1" cat="$2" loc="$3" ev="$4"
+    local sev="$1" cat="$2" loc="$3" ev="$4" band="${5:-}"
     # Strip target dir prefix (used for suppress matching and display)
     loc="${loc#$TARGET_DIR/}"
     # Suppress check: file:line:category triple
@@ -173,17 +350,65 @@ add_finding() {
         SUPPRESSED_COUNT=$((SUPPRESSED_COUNT + 1))
         return
     fi
+
+    # Derive band from location if not supplied by caller.
+    if [ -z "$band" ]; then
+        local _loc_file _loc_line _loc_full
+        _loc_full="${loc%%:[!:]*}"; _loc_full="${loc%:*}"  # everything before last :NN
+        _loc_file="${loc%:*}"
+        _loc_line="${loc##*:}"
+        # The location was stripped of TARGET_DIR/, so re-prefix for file read
+        case "$_loc_file" in
+            /*) ;;
+            *) _loc_file="$TARGET_DIR/$_loc_file" ;;
+        esac
+        band=$(classify_auth_band "$_loc_file" "$_loc_line")
+    fi
+    [ -z "$band" ] && band="UNKNOWN"
+
+    # Filter by --max-auth (default "all" = no filter).
+    local band_rank="${BAND_RANK[$band]:-99}"
+    if [ "$MAX_AUTH_RANK" -lt 99 ]; then
+        # UNKNOWN: include unless explicitly hidden
+        if [ "$band" = "UNKNOWN" ] && [ "$AUTH_UNTAGGED_SHOW" = "0" ]; then
+            : # show it (UNKNOWN findings are suspicious; default to display)
+        fi
+        if [ "$band_rank" -gt "$MAX_AUTH_RANK" ] && [ "$band" != "UNKNOWN" ]; then
+            # Drop out-of-scope, count separately
+            case "$sev" in
+                HIGH)   AUTH_OOS_HIGH=$((AUTH_OOS_HIGH + 1)) ;;
+                MEDIUM) AUTH_OOS_MED=$((AUTH_OOS_MED + 1)) ;;
+                LOW)    AUTH_OOS_LOW=$((AUTH_OOS_LOW + 1)) ;;
+            esac
+            FINDINGS+=("$sev|$cat|$loc|$band|OOS")
+            return
+        fi
+    fi
+
     case "$sev" in
-        HIGH)   HIGH_COUNT=$((HIGH_COUNT + 1)) ;;
-        MEDIUM) MED_COUNT=$((MED_COUNT + 1)) ;;
-        LOW)    LOW_COUNT=$((LOW_COUNT + 1)) ;;
+        HIGH)
+            HIGH_COUNT=$((HIGH_COUNT + 1))
+            HIGH_BY_BAND[$band]=$(( ${HIGH_BY_BAND[$band]:-0} + 1 ))
+            ;;
+        MEDIUM)
+            MED_COUNT=$((MED_COUNT + 1))
+            MED_BY_BAND[$band]=$(( ${MED_BY_BAND[$band]:-0} + 1 ))
+            ;;
+        LOW)
+            LOW_COUNT=$((LOW_COUNT + 1))
+            ;;
     esac
-    local c; c=$(color_for "$sev")
+    local c bc
+    c=$(color_for "$sev")
+    bc=$(band_color "$band")
     # Truncate evidence
     ev="${ev:0:160}"
-    printf '  %s[%s]%s %-38s %s\n' "$c" "$sev" "$RST" "$cat" "$loc"
+    # %-32s + 2-space separator guarantees the validate.py parser's `\s{2,}`
+    # gate always fires, even for max-length categories like
+    # "ajax handler missing cap/nonce" (30 chars).
+    printf '  %s[%s]%s %s[%s]%s %-32s  %s\n' "$c" "$sev" "$RST" "$bc" "$band" "$RST" "$cat" "$loc"
     printf '       %s\n' "$ev"
-    FINDINGS+=("$sev|$cat|$loc")
+    FINDINGS+=("$sev|$cat|$loc|$band|IN")
 }
 
 section() {
@@ -198,7 +423,11 @@ is_comment_line() {
 }
 
 scan_pattern_php() {
-    local sev="$1" cat="$2" regex="$3"
+    # Optional 4th arg: explicit auth band to apply to every emitted finding.
+    # Use this when the rule itself implies the band (e.g., rule 4 fires on
+    # `wp_ajax_nopriv_*` registrations — band is unambiguously NOPRIV
+    # regardless of which file the registration sits in).
+    local sev="$1" cat="$2" regex="$3" band="${4:-}"
     [ -z "$PHP_FILES" ] && return
     while IFS= read -r line; do
         [ -z "$line" ] && continue
@@ -206,12 +435,12 @@ scan_pattern_php() {
         file="${line%%:*}"; rest="${line#*:}"
         lineno="${rest%%:*}"; content="${rest#*:}"
         is_comment_line "$content" && continue
-        add_finding "$sev" "$cat" "$file:$lineno" "$content"
+        add_finding "$sev" "$cat" "$file:$lineno" "$content" "$band"
     done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "$regex" 2>/dev/null || true)
 }
 
 scan_pattern_js() {
-    local sev="$1" cat="$2" regex="$3" flags="${4:-}"
+    local sev="$1" cat="$2" regex="$3" flags="${4:-}" band="${5:-}"
     [ -z "$JS_FILES" ] && return
     while IFS= read -r line; do
         [ -z "$line" ] && continue
@@ -219,7 +448,7 @@ scan_pattern_js() {
         file="${line%%:*}"; rest="${line#*:}"
         lineno="${rest%%:*}"; content="${rest#*:}"
         is_comment_line "$content" && continue
-        add_finding "$sev" "$cat" "$file:$lineno" "$content"
+        add_finding "$sev" "$cat" "$file:$lineno" "$content" "$band"
     done < <(printf '%s\n' "$JS_FILES" | xargs -d '\n' -r grep -HnE $flags "$regex" 2>/dev/null || true)
 }
 
@@ -244,6 +473,287 @@ if [ -n "$PHP_FILES" ]; then
         | grep -iE '(sanitize|escape|esc_|kses|safe_|normalize|^strip_|_strip_|^clean_|_clean_)' \
         | sort -u | tr '\n' '|' | sed 's/|$//')
 fi
+
+############################
+# PRE-PASS: plugin-defined custom capability discovery
+############################
+# Walk every PHP file looking for capability-assignment patterns:
+#   $role->add_cap('foo_bar')           (most common — role object from get_role())
+#   $admin->add_cap('foo_bar')          (variant; classify by variable name)
+#   add_cap('foo_bar')                  (calls on an implicit role object)
+#   get_role('administrator')->add_cap('foo_bar')   (inline)
+# and the surrounding role context (the `get_role('X')` or `$role = X` that
+# the cap is assigned to) so we can map foo_bar → its highest-priority role.
+#
+# Result: CUSTOM_CAP_BAND['foo_bar'] = ADMIN | EDITOR | AUTHOR | SUBSCRIBER
+# Highest reachable role wins (i.e., if a cap is granted to Author AND
+# Administrator, we band it AUTHOR — the threshold the bug actually requires).
+if [ -n "$PHP_FILES" ]; then
+    # Find every line with an add_cap call AND a window of ~30 lines before it
+    # so we can see the get_role / $role = ... assignment. Streamed via awk.
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        file="${entry%%:*}"; rest="${entry#*:}"
+        lineno="${rest%%:*}"
+        # Window: 30 lines before, 1 line after
+        start=$((lineno - 30)); [ $start -lt 1 ] && start=1
+        end=$((lineno + 1))
+        window=$(sed -n "${start},${end}p" "$file" 2>/dev/null)
+
+        # Extract capability name from THIS line.
+        cap=$(echo "$rest" | grep -oE "add_cap\s*\(\s*['\"][a-zA-Z0-9_]+['\"]" \
+              | head -1 | grep -oE "['\"][a-zA-Z0-9_]+['\"]" | sed -E "s/['\"]//g" | head -1)
+        [ -z "$cap" ] && continue
+
+        # Determine the role this cap belongs to. Look in the window for
+        # role names mentioned in get_role()/foreach(array(...))/$role =
+        # construction. Lower-priority roles win — we report the SHALLOWEST
+        # role any add_cap path grants to (because that's the threshold the
+        # attacker actually needs).
+        band="UNKNOWN"
+        if echo "$window" | grep -qE "['\"](subscriber|customer|student)['\"]"; then
+            band="SUBSCRIBER"
+        elif echo "$window" | grep -qE "['\"](contributor|author)['\"]"; then
+            band="AUTHOR"
+        elif echo "$window" | grep -qE "['\"]editor['\"]|['\"]shop_manager['\"]"; then
+            band="EDITOR"
+        elif echo "$window" | grep -qE "['\"](administrator|super_admin)['\"]"; then
+            band="ADMIN"
+        fi
+
+        # Record the SHALLOWEST band ever seen for this cap.
+        prev="${CUSTOM_CAP_BAND[$cap]:-}"
+        if [ -z "$prev" ]; then
+            CUSTOM_CAP_BAND[$cap]="$band"
+        else
+            # Keep the lower rank
+            prev_rank="${BAND_RANK[$prev]:-99}"
+            new_rank="${BAND_RANK[$band]:-99}"
+            if [ "$new_rank" -lt "$prev_rank" ]; then
+                CUSTOM_CAP_BAND[$cap]="$band"
+            fi
+        fi
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "->[[:space:]]*add_cap\s*\(\s*['\"]" 2>/dev/null || true)
+fi
+
+############################
+# PRE-PASS: AJAX handler → band map (O(scan once), not O(N×M per finding))
+############################
+# Walk every PHP file ONCE looking for add_action('wp_ajax_*', callback) and
+# add_action('wp_ajax_nopriv_*', callback) calls. Extract the callback name
+# (string or array form). Build a hash: AJAX_HANDLER_BAND[func_name] = band.
+# NOPRIV beats priv (anyone-logged-in) at the same name. classify_auth_band()
+# looks up by function name in O(1) instead of grepping every file per call.
+declare -A AJAX_HANDLER_BAND=()
+if [ -n "$PHP_FILES" ]; then
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        line="${entry#*:*:}"  # drop file:lineno: prefix
+        # Same callback-extraction logic as Rule 10
+        tail_after_hook=$(echo "$line" | sed -E "s/^.*wp_ajax_(nopriv_)?[a-zA-Z0-9_-]+['\"][[:space:]]*,//")
+        cb=$(echo "$tail_after_hook" | grep -oE "['\"][a-zA-Z0-9_\\\\]+['\"]" | tail -1 | sed -E "s/['\"]//g")
+        [ -z "$cb" ] && continue
+        is_nopriv=0
+        echo "$line" | grep -q "wp_ajax_nopriv_" && is_nopriv=1
+        # Choose the more permissive band (NOPRIV wins).
+        prev="${AJAX_HANDLER_BAND[$cb]:-}"
+        if [ "$is_nopriv" = "1" ] || [ -z "$prev" ]; then
+            if [ "$is_nopriv" = "1" ] || [ "$prev" != "NOPRIV" ]; then
+                AJAX_HANDLER_BAND[$cb]=$([ "$is_nopriv" = "1" ] && echo NOPRIV || echo SUBSCRIBER)
+            fi
+        fi
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "add_action\s*\(\s*['\"]wp_ajax_" 2>/dev/null || true)
+fi
+
+# PRE-PASS: per-file admin/public hook count cache.
+# `classify_auth_band` previously re-ran two `grep -c` calls per finding to
+# count admin-vs-public hooks in the enclosing file. On big plugins with
+# many findings per file, that's wasteful. Cache it once per file.
+# (FILE_ADMIN_HOOKS / FILE_PUBLIC_HOOKS were replaced by FILE_HOOK_BAND in
+# _populate_file_cache below — one awk pass extracts everything.)
+
+# Per-file data cache for classify_auth_band. Populated lazily on first call
+# per file. One awk pass per file extracts ALL function spans, their caps,
+# and the file-level admin/public hook counts. After that, classify_auth_band
+# is pure bash hash lookups + in-memory parse — no subprocesses per finding.
+#
+# FILE_FUNC_DATA[file] format (newline-separated, one line per function):
+#   <start>|<end>|<func_name>|<caps_csv>|<has_login_floor>
+declare -A FILE_FUNC_DATA=()
+declare -A FILE_HOOK_BAND=()   # cached file-level admin/public/none hint
+
+# _populate_file_cache <file>
+# Runs ONE awk pass over the file to extract everything classify_auth_band
+# needs. After this returns, FILE_FUNC_DATA[file] and FILE_HOOK_BAND[file]
+# are populated.
+_populate_file_cache() {
+    local file="$1"
+    [ -n "${FILE_FUNC_DATA[$file]+set}" ] && return
+    [ ! -r "$file" ] && { FILE_FUNC_DATA[$file]=""; FILE_HOOK_BAND[$file]="UNKNOWN"; return; }
+
+    # Awk script: tracks current function span and caps within. Emits one
+    # record per function when the function ends (next function starts OR
+    # EOF). Also counts file-level admin vs public hook patterns.
+    local awk_out
+    awk_out=$(awk '
+        BEGIN { in_func=0; func_start=0; func_name=""; caps=""; floor=0; admin_hooks=0; pub_hooks=0 }
+        function emit() {
+            if (in_func) {
+                printf "F|%d|%d|%s|%s|%d\n", func_start, NR - 1, func_name, caps, floor
+            }
+            in_func=0; caps=""; floor=0
+        }
+        # Detect function start
+        /^[[:space:]]*(public|private|protected|static|final|abstract)?[[:space:]]*(public|private|protected|static|final|abstract)?[[:space:]]*function[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\(/ {
+            emit()
+            in_func=1; func_start=NR
+            match($0, /function[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*/)
+            func_name = substr($0, RSTART + 9, RLENGTH - 9)
+            sub(/^[[:space:]]+/, "", func_name)
+            next
+        }
+        # While inside a function, collect caps + login-floor markers.
+        in_func {
+            # Match current_user_can with single or double quoted cap name.
+            line = $0
+            while (match(line, /current_user_can[[:space:]]*\([[:space:]]*['\''"][a-zA-Z0-9_]+['\''"]/)) {
+                m = substr(line, RSTART, RLENGTH)
+                # Extract cap name between quotes
+                if (match(m, /['\''"][a-zA-Z0-9_]+['\''"]/)) {
+                    cap = substr(m, RSTART + 1, RLENGTH - 2)
+                    if (caps == "") caps = cap; else caps = caps "," cap
+                }
+                line = substr(line, RSTART + RLENGTH)
+            }
+            if (/is_user_logged_in[[:space:]]*\(\)|check_ajax_referer|check_admin_referer|wp_verify_nonce/) {
+                floor = 1
+            }
+        }
+        # Hook counters (file-level — count regardless of in_func).
+        /add_action[[:space:]]*\([[:space:]]*['\''"](admin_init|admin_menu|admin_post_|current_screen|admin_notices|in_admin_header|admin_enqueue_scripts)/ { admin_hooks++ }
+        /add_action[[:space:]]*\([[:space:]]*['\''"]wp_ajax_[a-zA-Z]/ && !/wp_ajax_nopriv_/ { admin_hooks++ }
+        /add_action[[:space:]]*\([[:space:]]*['\''"](wp_ajax_nopriv_|template_redirect|wp_enqueue_scripts|wp_loaded|parse_request|wp_head|wp_footer|template_include)/ { pub_hooks++ }
+        END {
+            emit()
+            printf "H|%d|%d\n", admin_hooks, pub_hooks
+        }
+    ' "$file" 2>/dev/null)
+
+    # Split: function records + 1 hook record at the end.
+    local hook_line
+    hook_line=$(printf '%s\n' "$awk_out" | grep '^H|' | tail -1)
+    FILE_FUNC_DATA[$file]=$(printf '%s\n' "$awk_out" | grep '^F|')
+
+    # Derive file-level hint from hook counts.
+    local _ah _ph
+    _ah="${hook_line#H|}"; _ah="${_ah%|*}"
+    _ph="${hook_line##*|}"
+    : "${_ah:=0}"; : "${_ph:=0}"
+    if [ "$_ah" -gt "$_ph" ] && [ "$_ah" -gt 2 ]; then
+        FILE_HOOK_BAND[$file]="ADMIN"
+    elif [ "$_ph" -gt "$_ah" ] && [ "$_ph" -gt 2 ]; then
+        FILE_HOOK_BAND[$file]="NOPRIV"
+    else
+        FILE_HOOK_BAND[$file]="UNKNOWN"
+    fi
+}
+
+# classify_auth_band <file> <lineno>
+# After _populate_file_cache runs (lazily), this is pure bash hash/string ops.
+# Output: prints band ("NOPRIV" / "SUBSCRIBER" / "AUTHOR" / "EDITOR" /
+# "ADMIN" / "UNKNOWN") to stdout.
+classify_auth_band() {
+    local file="$1" lineno="$2"
+    [ ! -r "$file" ] && { echo "UNKNOWN"; return; }
+    case "$lineno" in ''|*[!0-9]*) echo "UNKNOWN"; return ;; esac
+
+    _populate_file_cache "$file"
+
+    local rec func_name caps floor start end
+    local matched_record=""
+    while IFS= read -r rec; do
+        [ -z "$rec" ] && continue
+        # rec format: F|<start>|<end>|<func_name>|<caps_csv>|<has_login_floor>
+        IFS='|' read -r _tag start end func_name caps floor <<< "$rec"
+        if [ "$lineno" -ge "$start" ] && [ "$lineno" -le "$end" ]; then
+            matched_record="$rec"
+            break
+        fi
+    done <<< "${FILE_FUNC_DATA[$file]}"
+
+    # No enclosing function found — file-level code.
+    if [ -z "$matched_record" ]; then
+        # Path-based check first (admin/public file conventions).
+        case "$file" in
+            */admin/*|*/Admin/*|*/wp-admin/*) echo "ADMIN"; return ;;
+            */frontend/*|*/Frontend/*|*/public/*|*/Public/*) echo "NOPRIV"; return ;;
+            */class-*-admin.php|*admin-ajax*.php) echo "ADMIN"; return ;;
+            */class-*-public.php|*/class-*-frontend.php) echo "NOPRIV"; return ;;
+        esac
+        # File-level code with no cap context — likely runs on every load.
+        echo "NOPRIV"; return
+    fi
+
+    # AJAX handler lookup (O(1)).
+    if [ -n "$func_name" ]; then
+        local ajax_band="${AJAX_HANDLER_BAND[$func_name]:-}"
+        if [ -n "$ajax_band" ]; then
+            echo "$ajax_band"; return
+        fi
+    fi
+
+    # Caps from the function body — choose the SHALLOWEST band among them.
+    local cap band rank shallowest_band="UNKNOWN" shallowest_rank=99
+    if [ -n "$caps" ]; then
+        IFS=',' read -r -a _cap_arr <<< "$caps"
+        for cap in "${_cap_arr[@]}"; do
+            [ -z "$cap" ] && continue
+            band="${STD_CAP_BAND[$cap]:-}"
+            [ -z "$band" ] && band="${CUSTOM_CAP_BAND[$cap]:-}"
+            [ -z "$band" ] && continue
+            rank="${BAND_RANK[$band]:-99}"
+            if [ "$rank" -lt "$shallowest_rank" ]; then
+                shallowest_rank="$rank"; shallowest_band="$band"
+            fi
+        done
+    fi
+
+    if [ "$shallowest_band" != "UNKNOWN" ]; then
+        echo "$shallowest_band"; return
+    fi
+
+    # No cap, but has nonce / is_user_logged_in floor → SUBSCRIBER.
+    if [ "$floor" = "1" ]; then
+        echo "SUBSCRIBER"; return
+    fi
+
+    # 4) Path-based fallback heuristic. By WordPress plugin convention:
+    #
+    #   - Files under */admin/*, */Admin/*, or named class-*-admin.php /
+    #     */admin-ajax*.php run in the wp-admin context. Reachable only by
+    #     users who can `read` (Subscriber+) at minimum — admin-side checks
+    #     (`is_admin()`, `admin_menu`, `admin_init`) shift the effective floor
+    #     to whatever role the admin menu entry is registered at. The safest
+    #     conservative assumption is ADMIN unless the function shows otherwise.
+    #
+    #   - Files under */frontend/*, */Frontend/*, */public/*, or named
+    #     class-*-public.php / class-*-frontend.php run on the public site
+    #     and may be reached unauthenticated. NOPRIV by convention.
+    #
+    # This is a heuristic — it can be overridden by an explicit cap check in
+    # the function (handled above). Without an explicit cap, the convention
+    # is the best signal we have.
+    case "$file" in
+        */admin/*|*/Admin/*|*/wp-admin/*|*/wp-Admin/*) echo "ADMIN"; return ;;
+        */frontend/*|*/Frontend/*|*/public/*|*/Public/*) echo "NOPRIV"; return ;;
+        */class-*-admin.php|*admin-ajax*.php) echo "ADMIN"; return ;;
+        */class-*-public.php|*/class-*-frontend.php) echo "NOPRIV"; return ;;
+    esac
+
+    # File-level hook hint (cached in _populate_file_cache).
+    local hint="${FILE_HOOK_BAND[$file]:-UNKNOWN}"
+    echo "$hint"
+}
 
 ############################
 # PHP CHECKS
@@ -284,9 +794,10 @@ if [ -n "$PHP_FILES" ]; then
     done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "(^|[^[:alnum:]_>])unserialize[[:space:]]*\(" 2>/dev/null || true)
 fi
 
-# 4. wp_ajax_nopriv handlers (unauth AJAX)
+# 4. wp_ajax_nopriv handlers (unauth AJAX) — band is unambiguously NOPRIV.
 scan_pattern_php MEDIUM "wp_ajax_nopriv handler" \
-    "add_action[[:space:]]*\([[:space:]]*['\"]wp_ajax_nopriv_"
+    "add_action[[:space:]]*\([[:space:]]*['\"]wp_ajax_nopriv_" \
+    "NOPRIV"
 
 # 5. file_put_contents / move_uploaded_file
 scan_pattern_php HIGH "file write / upload" \
@@ -460,9 +971,13 @@ if [ -n "$PHP_FILES" ]; then
             continue
         fi
         sev="MEDIUM"
-        [ "$is_nopriv" = "1" ] && sev="HIGH"
+        band="SUBSCRIBER"   # priv handler with no cap = any logged-in user (subscriber floor)
+        if [ "$is_nopriv" = "1" ]; then
+            sev="HIGH"
+            band="NOPRIV"
+        fi
         AJAX_SEEN[$cb]="$sev"
-        add_finding "$sev" "ajax handler missing cap/nonce" "$deffile:$defline" "function ${cb}(...) — no current_user_can / nonce check"
+        add_finding "$sev" "ajax handler missing cap/nonce" "$deffile:$defline" "function ${cb}(...) — no current_user_can / nonce check" "$band"
     done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "add_action[[:space:]]*\([[:space:]]*['\"]wp_ajax_" 2>/dev/null \
               | awk '/wp_ajax_nopriv_/ {n=n $0 "\n"; next} {p=p $0 "\n"} END {printf "%s%s", n, p}' || true)
 fi
@@ -512,18 +1027,61 @@ printf '  %sLOW:    %d%s\n' "$GRN" "$LOW_COUNT" "$RST"
 [ "$SUPPRESSED_COUNT" -gt 0 ] && printf '  suppressed: %d  (per .screener-suppress)\n' "$SUPPRESSED_COUNT"
 echo
 
-# Score thresholds
+# Auth-band breakdown — counts ONLY in-scope (or all if --max-auth=all).
+# Wordfence eligibility: NOPRIV / SUBSCRIBER / AUTHOR are in-scope; EDITOR
+# and ADMIN are explicitly out of scope per the bounty rules. The breakdown
+# lets the user see how much of the surface lives in each band without
+# re-reading the per-finding output.
+WF_IN_SCOPE_HIGH=$(( ${HIGH_BY_BAND[NOPRIV]:-0} + ${HIGH_BY_BAND[SUBSCRIBER]:-0} + ${HIGH_BY_BAND[AUTHOR]:-0} ))
+WF_IN_SCOPE_MED=$(( ${MED_BY_BAND[NOPRIV]:-0} + ${MED_BY_BAND[SUBSCRIBER]:-0} + ${MED_BY_BAND[AUTHOR]:-0} ))
+WF_OOS_HIGH=$(( ${HIGH_BY_BAND[EDITOR]:-0} + ${HIGH_BY_BAND[ADMIN]:-0} ))
+WF_OOS_MED=$(( ${MED_BY_BAND[EDITOR]:-0} + ${MED_BY_BAND[ADMIN]:-0} ))
+
+section "Auth-band breakdown"
+printf '  %-12s  HIGH=%2d  MEDIUM=%2d   %s\n' "NOPRIV"      "${HIGH_BY_BAND[NOPRIV]:-0}"     "${MED_BY_BAND[NOPRIV]:-0}"     "(unauthenticated)"
+printf '  %-12s  HIGH=%2d  MEDIUM=%2d   %s\n' "SUBSCRIBER"  "${HIGH_BY_BAND[SUBSCRIBER]:-0}" "${MED_BY_BAND[SUBSCRIBER]:-0}" "(Subscriber / Customer / Student)"
+printf '  %-12s  HIGH=%2d  MEDIUM=%2d   %s\n' "AUTHOR"      "${HIGH_BY_BAND[AUTHOR]:-0}"     "${MED_BY_BAND[AUTHOR]:-0}"     "(Contributor / Author)"
+printf '  %-12s  HIGH=%2d  MEDIUM=%2d   %s\n' "EDITOR"      "${HIGH_BY_BAND[EDITOR]:-0}"     "${MED_BY_BAND[EDITOR]:-0}"     "${CYA}(Wordfence: OUT-OF-SCOPE)${RST}"
+printf '  %-12s  HIGH=%2d  MEDIUM=%2d   %s\n' "ADMIN"       "${HIGH_BY_BAND[ADMIN]:-0}"      "${MED_BY_BAND[ADMIN]:-0}"      "${CYA}(Wordfence: OUT-OF-SCOPE)${RST}"
+printf '  %-12s  HIGH=%2d  MEDIUM=%2d   %s\n' "UNKNOWN"     "${HIGH_BY_BAND[UNKNOWN]:-0}"    "${MED_BY_BAND[UNKNOWN]:-0}"    "(classifier couldn't tell)"
+echo
+printf '  '"$BLD"'Wordfence in-scope:'"$RST"'      HIGH=%d  MEDIUM=%d\n' "$WF_IN_SCOPE_HIGH" "$WF_IN_SCOPE_MED"
+printf '  Wordfence out-of-scope:  HIGH=%d  MEDIUM=%d\n' "$WF_OOS_HIGH" "$WF_OOS_MED"
+if [ "$MAX_AUTH" != "all" ]; then
+    printf '  (filtered by --max-auth=%s: dropped HIGH=%d  MEDIUM=%d  LOW=%d above band)\n' "$MAX_AUTH" "$AUTH_OOS_HIGH" "$AUTH_OOS_MED" "$AUTH_OOS_LOW"
+fi
+echo
+
+# Verdict thresholds — count in-scope only when computing target ranking.
+# A plugin with 80 admin-gated HIGHs is OUT-OF-SCOPE for our bounty program
+# regardless of total HIGH count.
 SCORE="SKIP"
 SCORE_COLOR="$GRN"
-if [ "$HIGH_COUNT" -ge 3 ] || { [ "$HIGH_COUNT" -ge 1 ] && [ "$MED_COUNT" -ge 3 ]; }; then
+if [ "$WF_IN_SCOPE_HIGH" -ge 3 ] || { [ "$WF_IN_SCOPE_HIGH" -ge 1 ] && [ "$WF_IN_SCOPE_MED" -ge 3 ]; }; then
     SCORE="HIGH-VALUE-TARGET"
     SCORE_COLOR="$RED"
-elif [ "$HIGH_COUNT" -ge 1 ] || [ "$MED_COUNT" -ge 2 ]; then
+elif [ "$WF_IN_SCOPE_HIGH" -ge 1 ] || [ "$WF_IN_SCOPE_MED" -ge 2 ]; then
     SCORE="INVESTIGATE"
     SCORE_COLOR="$YEL"
+elif [ "$HIGH_COUNT" -ge 3 ]; then
+    # Has HIGHs but they're all out-of-scope.
+    SCORE="OOS-ONLY"
+    SCORE_COLOR="$CYA"
 fi
 
-printf '%sOverall: %s%s%s\n' "$BLD" "$SCORE_COLOR" "$SCORE" "$RST"
+printf '%sOverall: %s%s%s' "$BLD" "$SCORE_COLOR" "$SCORE" "$RST"
+if [ "$SCORE" = "OOS-ONLY" ]; then
+    printf '  (Editor/Admin-only surface — not Wordfence-bountyable)'
+fi
 echo
+echo
+# Machine-readable summary — extended with auth-band columns.
+# Format: HIGH MED LOW SCORE | nopriv_H sub_H author_H editor_H admin_H unknown_H | nopriv_M sub_M author_M editor_M admin_M unknown_M
 printf 'SCREENER_SUMMARY\t%d\t%d\t%d\t%s\n' "$HIGH_COUNT" "$MED_COUNT" "$LOW_COUNT" "$SCORE"
+printf 'SCREENER_AUTHBAND_HIGH\t%d\t%d\t%d\t%d\t%d\t%d\n' \
+    "${HIGH_BY_BAND[NOPRIV]:-0}" "${HIGH_BY_BAND[SUBSCRIBER]:-0}" "${HIGH_BY_BAND[AUTHOR]:-0}" \
+    "${HIGH_BY_BAND[EDITOR]:-0}" "${HIGH_BY_BAND[ADMIN]:-0}" "${HIGH_BY_BAND[UNKNOWN]:-0}"
+printf 'SCREENER_AUTHBAND_MED\t%d\t%d\t%d\t%d\t%d\t%d\n' \
+    "${MED_BY_BAND[NOPRIV]:-0}" "${MED_BY_BAND[SUBSCRIBER]:-0}" "${MED_BY_BAND[AUTHOR]:-0}" \
+    "${MED_BY_BAND[EDITOR]:-0}" "${MED_BY_BAND[ADMIN]:-0}" "${MED_BY_BAND[UNKNOWN]:-0}"
 echo "Report saved: $OUT_FILE"

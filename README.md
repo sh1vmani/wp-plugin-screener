@@ -44,13 +44,25 @@ Static pattern scan of first-party PHP and JS in a plugin (vendored libraries ex
 
 **Per-plugin suppression:** drop a `.screener-suppress` file at the plugin root with `file:line:category` lines to silence known-FP findings on subsequent runs.
 
-Output ends with a machine-readable line:
+**Auth-band classification:** every finding is tagged with the WordPress role required to reach it — `NOPRIV` (unauth), `SUBSCRIBER`, `AUTHOR`, `EDITOR`, `ADMIN`, or `UNKNOWN`. The classifier walks the enclosing function for `current_user_can('cap')` calls and maps each cap to a band via a hardcoded WP-standard table plus a plugin-defined custom-cap discovery pre-pass (`$role->add_cap('foo')` scan). Falls back to file-path conventions (`*/admin/*` → ADMIN, `*/frontend/*` → NOPRIV) and file-level hook patterns (`admin_init` / `template_redirect` ratios) when no explicit cap is present. Cached per-file via one awk pass so per-finding lookups are O(1).
+
+Use `--max-auth=<band>` to filter findings reachable only by bands above the given level. Useful for Wordfence-style bug-bounty work where Editor / Admin / Super Admin are out of scope:
+
+```bash
+./wp-plugin-screener.sh --max-auth=author plugin/      # show only ≤Author-reachable findings
+./wp-plugin-screener.sh --max-auth=nopriv plugin/      # show only unauthenticated findings
+./wp-plugin-screener.sh --max-auth=all plugin/         # default — tag, don't filter
+```
+
+Output ends with machine-readable lines:
 
 ```
-SCREENER_SUMMARY  <HIGH>  <MED>  <LOW>  <verdict>
+SCREENER_SUMMARY         <HIGH> <MED> <LOW> <verdict>
+SCREENER_AUTHBAND_HIGH   <nopriv> <sub> <author> <editor> <admin> <unknown>
+SCREENER_AUTHBAND_MED    <nopriv> <sub> <author> <editor> <admin> <unknown>
 ```
 
-Verdicts: `HIGH-VALUE-TARGET` / `INVESTIGATE` / `SKIP`. Use the underlying counts and categories for real decisions — the verdict label is coarse.
+Verdicts: `HIGH-VALUE-TARGET` / `INVESTIGATE` / `SKIP` / `OOS-ONLY` (has HIGHs but they're all Editor+/Admin-gated — out of scope for bounty work). The verdict counts in-scope findings (NOPRIV + SUBSCRIBER + AUTHOR) only; the underlying total counts include all bands. Use the band breakdown for real decisions — the verdict label is coarse.
 
 ### `tools/calibration/validate.py` — the calibration harness
 
@@ -135,7 +147,8 @@ These require either an AST pass with proper scope tracking or a parsed entry-po
 
 ## Roadmap
 
-- **v0.2** — entry-point + sink index (parse PHP once into a `(file, class, function, hook, cap_check, nonce_check, sources, sinks)` table; queries replace ad-hoc regex rules)
+- **v0.1.1 (current)** — auth-band classification (`--max-auth` filter; cap-check + path-hint + hook-hint heuristic, one awk pass per file cached for O(1) per-finding lookups). Covers the `cap_check` column of the eventual v0.2 index.
+- **v0.2** — full entry-point + sink index (parse PHP once into a `(file, class, function, hook, cap_check, nonce_check, sources, sinks)` table; queries replace ad-hoc regex rules; gets cross-function reachability the regex rules can't)
 - **v0.3** — differential mode (`--diff old:new` runs rules only against changed lines between releases — silent-patch / incomplete-fix hunting)
 - **v0.4** — Semgrep alongside as a parallel screener; anything it catches that we don't becomes a rule candidate
 

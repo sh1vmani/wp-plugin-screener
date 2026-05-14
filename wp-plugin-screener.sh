@@ -565,6 +565,94 @@ if [ -n "$PHP_FILES" ]; then
     done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "add_action\s*\(\s*['\"]wp_ajax_" 2>/dev/null || true)
 fi
 
+############################
+# PRE-PASS: admin-menu callback → band map
+############################
+# WordPress's `add_menu_page` and `add_submenu_page` register an admin-screen
+# callback with an explicit capability. The cap is the 3rd positional arg of
+# `add_menu_page` and the 4th of `add_submenu_page`. Any function reached
+# through these paths is effectively gated by that cap regardless of what
+# `current_user_can` calls live inside the function body — typically NONE,
+# because the menu registration already enforced the cap.
+#
+# Without this pre-pass, classify_auth_band tagged admin-screen handlers as
+# SUBSCRIBER (because they had a nonce check but no cap check in the body),
+# leading to spurious in-scope HIGHs. Now we map callback → capability and
+# resolve the cap to its band via STD_CAP_BAND / CUSTOM_CAP_BAND.
+#
+# Result: MENU_CALLBACK_BAND[func_name] = NOPRIV | SUBSCRIBER | AUTHOR | EDITOR | ADMIN
+declare -A MENU_CALLBACK_BAND=()
+if [ -n "$PHP_FILES" ]; then
+    # add_menu_page($page_title, $menu_title, $capability, $menu_slug, $callback, ...)
+    #   ^ args 1     2            3 cap        4           5 callback
+    # add_submenu_page($parent_slug, $page_title, $menu_title, $capability, $menu_slug, $callback, ...)
+    #   ^ args 1                     2            3            4 cap        5           6 callback
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        line="${entry#*:*:}"
+        # Determine which function and slice off the call prefix so positions
+        # are predictable. We do a coarse comma-split inside the parens.
+        # Conservative: only handle the case where the cap and callback are
+        # both on a single line (the common case in WP plugins).
+        is_submenu=0
+        echo "$line" | grep -q 'add_submenu_page' && is_submenu=1
+
+        # Extract everything between the outermost ( ... )
+        args_blob=$(echo "$line" | sed -E 's/^[^(]*\(//; s/\)[^)]*$//')
+
+        # Split by commas at depth 0. Bash doesn't have nested-aware splitter
+        # cheaply; for the simple `'literal'` / `array($this,'method')` /
+        # `[$this,'method']` shapes used in WP, awk gives us a usable split.
+        # Strategy: replace `[$this,'fn']` and `array($this,'fn')` with
+        # `<<CB>>'fn'<<CB>>` first so the comma inside the callback array
+        # doesn't confuse positional split.
+        normalized=$(echo "$args_blob" | sed -E "s/\[[[:space:]]*\\\$this[[:space:]]*,[[:space:]]*(['\"][^'\"]+['\"])[[:space:]]*\]/<<CB>>\1<<CB>>/g; s/array[[:space:]]*\(\s*\\\$this[[:space:]]*,[[:space:]]*(['\"][^'\"]+['\"])[[:space:]]*\)/<<CB>>\1<<CB>>/g")
+
+        # Now split on top-level commas.
+        IFS=',' read -ra parts <<< "$normalized"
+        # Trim whitespace from each part
+        for i in "${!parts[@]}"; do
+            parts[$i]="$(echo "${parts[$i]}" | sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        done
+
+        if [ "$is_submenu" = "1" ]; then
+            cap_idx=3
+            cb_idx=5
+        else
+            cap_idx=2
+            cb_idx=4
+        fi
+        cap_raw="${parts[$cap_idx]:-}"
+        cb_raw="${parts[$cb_idx]:-}"
+        # Strip quotes around cap
+        cap=$(echo "$cap_raw" | grep -oE "['\"][a-zA-Z0-9_]+['\"]" | head -1 | sed -E "s/['\"]//g")
+        # Callback: the last quoted identifier in the raw (handles both
+        # 'fn' and <<CB>>'method'<<CB>>).
+        cb=$(echo "$cb_raw" | grep -oE "['\"][a-zA-Z0-9_\\\\]+['\"]" | tail -1 | sed -E "s/['\"]//g")
+        [ -z "$cap" ] && continue
+        [ -z "$cb" ] && continue
+
+        # Map cap to band.
+        band="${STD_CAP_BAND[$cap]:-}"
+        [ -z "$band" ] && band="${CUSTOM_CAP_BAND[$cap]:-}"
+        [ -z "$band" ] && continue
+
+        # Take the shallowest band ever seen for this callback (a callback
+        # registered on multiple menu pages with different caps gets the
+        # most-permissive of them).
+        prev="${MENU_CALLBACK_BAND[$cb]:-}"
+        if [ -z "$prev" ]; then
+            MENU_CALLBACK_BAND[$cb]="$band"
+        else
+            prev_rank="${BAND_RANK[$prev]:-99}"
+            new_rank="${BAND_RANK[$band]:-99}"
+            if [ "$new_rank" -lt "$prev_rank" ]; then
+                MENU_CALLBACK_BAND[$cb]="$band"
+            fi
+        fi
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "add_(menu|submenu)_page\s*\(" 2>/dev/null || true)
+fi
+
 # PRE-PASS: per-file admin/public hook count cache.
 # `classify_auth_band` previously re-ran two `grep -c` calls per finding to
 # count admin-vs-public hooks in the enclosing file. On big plugins with
@@ -685,7 +773,7 @@ classify_auth_band() {
     if [ -z "$matched_record" ]; then
         # Path-based check first (admin/public file conventions).
         case "$file" in
-            */admin/*|*/Admin/*|*/wp-admin/*) echo "ADMIN"; return ;;
+            */admin/*|*/Admin/*|*/admin-*/*|*/Admin-*/*|*/wp-admin/*) echo "ADMIN"; return ;;
             */frontend/*|*/Frontend/*|*/public/*|*/Public/*) echo "NOPRIV"; return ;;
             */class-*-admin.php|*admin-ajax*.php) echo "ADMIN"; return ;;
             */class-*-public.php|*/class-*-frontend.php) echo "NOPRIV"; return ;;
@@ -699,6 +787,17 @@ classify_auth_band() {
         local ajax_band="${AJAX_HANDLER_BAND[$func_name]:-}"
         if [ -n "$ajax_band" ]; then
             echo "$ajax_band"; return
+        fi
+    fi
+
+    # Admin-menu callback lookup (O(1)). When the function is registered as
+    # an admin-page callback via add_menu_page / add_submenu_page, the cap on
+    # that registration is what gates the function — usually `manage_options`
+    # = ADMIN, but the cap can be any standard or custom cap.
+    if [ -n "$func_name" ]; then
+        local menu_band="${MENU_CALLBACK_BAND[$func_name]:-}"
+        if [ -n "$menu_band" ]; then
+            echo "$menu_band"; return
         fi
     fi
 
@@ -744,7 +843,7 @@ classify_auth_band() {
     # the function (handled above). Without an explicit cap, the convention
     # is the best signal we have.
     case "$file" in
-        */admin/*|*/Admin/*|*/wp-admin/*|*/wp-Admin/*) echo "ADMIN"; return ;;
+        */admin/*|*/Admin/*|*/admin-*/*|*/Admin-*/*|*/wp-admin/*|*/wp-Admin/*) echo "ADMIN"; return ;;
         */frontend/*|*/Frontend/*|*/public/*|*/Public/*) echo "NOPRIV"; return ;;
         */class-*-admin.php|*admin-ajax*.php) echo "ADMIN"; return ;;
         */class-*-public.php|*/class-*-frontend.php) echo "NOPRIV"; return ;;

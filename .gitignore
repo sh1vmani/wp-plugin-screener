@@ -1,0 +1,57 @@
+# This repo ships ONLY the screener + scanner + calibration harness.
+# Everything else in the working directory is third-party or private.
+
+# Audit toolkit (third-party — not mine to publish)
+AUDIT-MATRIX.md
+AUDIT-VERIFICATION-PROTOCOL.md
+BEST-PRACTICES.md
+POC-VIDEO-RECORDING-GUIDE.md
+TOOLKIT-IMPROVEMENT-NOTES.md
+FOLDER-STRUCTURE.md
+WORDFENCE-DECISION-MATRIX.md
+HACKERONE-DECISION-MATRIX.md
+BUGCROWD-DECISION-MATRIX.md
+
+# Private audit artifacts and findings
+wordfence/
+research-data/
+
+# Personal session logs and workflow
+SESSION-*.md
+session-log-template.md
+batch-audit.sh
+batch-prompt.md
+batch-run.log
+plugins-queue.txt
+learned-patterns-log.md
+learned-patterns-summary.md
+
+# Internal automation harness
+CLAUDE.md
+.claude/
+commands/
+skill/
+
+# Calibration corpus references pre-disclosure findings — stays private
+tools/calibration/corpus.json
+tools/calibration/baseline.json
+tools/calibration/baseline-v*.json
+tools/calibration/REPORT.md
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Build / runtime
+node_modules/
+__pycache__/
+*.pyc
+
+# Local config
+.env
+.env.local
+
+# Plugin zips (downloaded by target-finder at runtime)
+*.zip

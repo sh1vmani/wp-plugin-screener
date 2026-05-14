@@ -1,0 +1,24 @@
+{
+  "_comment": "Template for building a calibration corpus. Replace each entry with your own audited plugins. Real corpus.json with confirmed-yield findings is gitignored until disclosures are public.",
+  "yield": [
+    {
+      "slug": "example-vulnerable-plugin",
+      "f01": "F01-some-finding-name",
+      "cwe": ["CWE-79"],
+      "expected_sink_files": ["includes/vulnerable-file.php"],
+      "expected_screener_categories": ["unsanitized superglobal"],
+      "current_screener_can_catch": true,
+      "miss_reason": null,
+      "phase1_target": null
+    }
+  ],
+  "clean": [
+    {"slug": "example-clean-plugin", "audit": "2026-01-01", "verdict": "clean"}
+  ],
+  "killed": [
+    {"slug": "example-killed-plugin", "f01": "F01-killed", "verdict": "candidate killed — not submittable"}
+  ],
+  "exclude": [
+    {"slug": "example-excluded-plugin", "reason": "F01 retracted; report incomplete"}
+  ]
+}

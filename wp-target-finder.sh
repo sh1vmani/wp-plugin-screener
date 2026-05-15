@@ -31,7 +31,12 @@ LIMIT=200            # how many popular plugins to seed from wp.org
 MIN_INSTALLS=100000   # hunt-workflow gate: >=100k floor (watchlist --slug bypasses)
 TOP_N=3              # how many to render in the top list (now: one per install bucket)
 DOWNLOAD_N=3         # how many to download + screen
-MIN_UPDATE_AGE_DAYS=30   # exclude plugins updated within the last N days (active patches)
+MIN_UPDATE_AGE_DAYS=0    # hard-exclude plugins updated within the last N days.
+                         # Default 0 = no hard cut: recency is handled by the
+                         # tiered last-update SCORING instead (2–6mo preferred,
+                         # >=1mo acceptable, <1mo last-resort/decreasing), so
+                         # fresh-patch plugins are deprioritized, not dropped.
+                         # Set e.g. --min-update-age 30 to hard-skip <30d again.
 CACHE_DIR="$HOME/.cache/wp-target-finder"
 SCREENER="$HOME/wp-plugin-screener.sh"
 SVNDIFF="$HOME/wp-svn-diff.sh"
@@ -118,7 +123,8 @@ DISCOVERY OPTIONS:
   --limit N                Seed pool size (default 200; split across browse modes)
   --min-installs N         Minimum active installs (default 100000; hunt-workflow
                            floor — watchlist --slug bypasses it)
-  --min-update-age N       Skip plugins updated within N days (default 30)
+  --min-update-age N       Hard-skip plugins updated within N days (default 0
+                           = no hard cut; recency handled by tiered scoring)
   --slug X[,Y,Z]           Force-include specific slugs (bypasses install/update gates)
   --category TAG[,TAG2]    Bias seed pool by wp.org tag (forms,membership,crm,security,...)
 
@@ -171,8 +177,13 @@ SCORING TIERS (Python scorer; see also score_reasons in output):
     Vague-security phrase in changelog  +3 per hit, cap +15
     Silent-patch in version <90d old    +15
 
-  Maintenance:
-    Last update 180-730 days ago        +5  (stale but in scope)
+  Last-update recency (tiered preference):
+    last update 60-180d  (2-6 mo)       +10  PREFERRED window
+    last update 30-60d   (1-2 mo)        +5  acceptable (>=1 mo)
+    last update 180-365d (6-12 mo)       +3  acceptable, older
+    last update <30d     (<1 mo)        +0..2 last resort, scaled by age
+                                             (older-within-month ranks higher)
+    last update >365d    (>12 mo)        +0  neglected / picked-over
 
   Screener (when run):
     50+ in-scope HIGH                   +6
@@ -454,7 +465,10 @@ _DEFAULT_WEIGHTS = {
     "fresh_silent_patch":   15,
     "already_hunted":      -10,   # 5+ CVEs / 12mo
     "cve_active_surface":    2,   # 1–4 CVEs / 12mo
-    "patch_stale":           5,   # last update 180–730d
+    "upd_2_6mo":            10,   # last update 60–180d  (PREFERRED window)
+    "upd_1_2mo":             5,   # last update 30–60d   (>=1mo, acceptable)
+    "upd_6_12mo":            3,   # last update 180–365d (older, acceptable)
+    "upd_under_1mo":         2,   # last update <30d, scaled by age (last resort)
     "screener_high_50":      6,
     "screener_high_20":      4,
     "screener_high_10":      2,
@@ -829,7 +843,16 @@ elif cmd == "score":
         w = W["cve_active_surface"]; score += w
         reasons.append((_d(w), f"{n_12mo} CVE(s) in 12 mo (active surface)"))
 
-    # 6. Patch staleness — last_updated > 6 months suggests neglected maintenance
+    # 6. Last-update recency preference (tiered). Sweet spot is a plugin that
+    # shipped a release 2–6 months ago: recent enough to have a diffable
+    # security patch with likely incomplete-fix siblings, old enough that the
+    # very-fresh-patch swarm has moved on. Priority order:
+    #   2–6 mo (60–180d)  : PREFERRED            -> big bonus
+    #   1–2 mo (30–60d)   : acceptable (>=1 mo)  -> medium
+    #   6–12 mo (180–365d): acceptable, older    -> small
+    #   <1 mo  (<30d)     : last resort, ranked in DECREASING order so the
+    #                       older-within-the-month outranks the just-shipped
+    #   >12 mo (>365d)    : neglected/picked-over -> no bonus
     last_upd = rec.get("last_updated","") or ""
     days_since_patch = 0
     if last_upd:
@@ -838,9 +861,22 @@ elif cmd == "score":
             days_since_patch = (today - d).days
         except Exception:
             pass
-    if days_since_patch >= 180 and days_since_patch <= 730:
-        w = W["patch_stale"]; score += w
-        reasons.append((_d(w), f"last update {days_since_patch}d ago (stale but in scope)"))
+    if 60 <= days_since_patch <= 180:
+        w = W["upd_2_6mo"]; score += w
+        reasons.append((_d(w), f"last update {days_since_patch}d ago (2–6 mo — PREFERRED window)"))
+    elif 30 <= days_since_patch < 60:
+        w = W["upd_1_2mo"]; score += w
+        reasons.append((_d(w), f"last update {days_since_patch}d ago (1–2 mo — acceptable)"))
+    elif 180 < days_since_patch <= 365:
+        w = W["upd_6_12mo"]; score += w
+        reasons.append((_d(w), f"last update {days_since_patch}d ago (6–12 mo — acceptable, older)"))
+    elif 0 <= days_since_patch < 30:
+        # Last resort: scale by age so within <30d, older ranks higher
+        # (decreasing order — the just-shipped patch is swarmed; deprioritize).
+        base = W["upd_under_1mo"]
+        w = round(base * days_since_patch / 30.0)
+        score += w
+        reasons.append((_d(w), f"last update {days_since_patch}d ago (<1 mo — last resort, decreasing)"))
 
     # Screener-derived scoring. Wordfence-eligible scope is NOPRIV +
     # SUBSCRIBER + AUTHOR (Editor / Admin / Super Admin are out of scope).

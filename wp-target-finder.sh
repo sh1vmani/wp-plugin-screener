@@ -199,8 +199,8 @@ EXAMPLES:
   # Default daily run
   wp-target-finder.sh
 
-  # Force-include duplicate-post regardless of filters
-  wp-target-finder.sh --slug duplicate-post --include-audited
+  # Force-include a specific slug regardless of filters
+  wp-target-finder.sh --slug your-plugin-slug --include-audited
 
   # Seed from forms-category plugins, 6 workers, cache-only
   wp-target-finder.sh --category forms --concurrency 6 --cache-only

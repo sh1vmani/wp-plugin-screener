@@ -134,9 +134,25 @@ declare -A STD_CAP_BAND=(
 # Plugin-defined custom caps: populated by CAP_DISCOVERY pre-pass.
 declare -A CUSTOM_CAP_BAND=()
 
+# Tier 6 #31 — single-page rules reference. Auto-extracted from this script's
+# own rule-header comments so it never drifts from the implementation.
+_print_rules() {
+    local self="${BASH_SOURCE[0]}"
+    echo "wp-plugin-screener — detection rules (auto-extracted from source)"
+    echo "Every finding is annotated with a Wordfence auth band:"
+    echo "  NOPRIV / SUBSCRIBER / AUTHOR  = in Wordfence bounty scope"
+    echo "  EDITOR / ADMIN                = out of scope   UNKNOWN = unclassified"
+    echo "---------------------------------------------------------------------------"
+    grep -oE '^# [0-9]+[a-z]?\. .+' "$self" \
+      | sed 's/^# /  Rule /' \
+      | sort -V -u
+    echo "---------------------------------------------------------------------------"
+    echo "Refs in descriptions: CWE-* (MITRE), BC-* / AP-* (internal audit matrix)."
+}
+
 usage() {
     cat >&2 <<EOF
-Usage: $0 [--max-auth=<band>] [--auth-untagged-show] <plugin.zip|plugin-directory>
+Usage: $0 [--max-auth=<band>] [--rules] [--auth-untagged-show] <plugin.zip|plugin-directory>
 
   --max-auth=<band>         Filter findings reachable only by auth bands ABOVE
                             the given level. Use this to focus on Wordfence-
@@ -166,6 +182,7 @@ while [ $# -gt 0 ]; do
         --max-auth=*)        MAX_AUTH="${1#--max-auth=}" ;;
         --max-auth)          shift; MAX_AUTH="${1:-}" ;;
         --auth-untagged-show) AUTH_UNTAGGED_SHOW=1 ;;
+        --rules)             _print_rules; exit 0 ;;
         -h|--help)           usage ;;
         --)                  shift; break ;;
         --*)                 echo "Unknown option: $1" >&2; usage ;;

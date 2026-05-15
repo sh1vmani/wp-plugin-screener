@@ -220,6 +220,15 @@ else
     usage
 fi
 
+# 4F: normalize TARGET_DIR. A trailing slash makes the add_finding strip
+# pattern "${loc#$TARGET_DIR/}" become "dir//", which never matches find's
+# single-slash output; the prefix then survives, the re-prefix branch doubles
+# the path, classify_auth_band can't read it, and every finding is mis-banded
+# UNKNOWN. Strip trailing slashes once, here, before any find/strip use.
+while [ "$TARGET_DIR" != "/" ] && [ "${TARGET_DIR%/}" != "$TARGET_DIR" ]; do
+    TARGET_DIR="${TARGET_DIR%/}"
+done
+
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_FILE="$OUT_DIR/${PLUGIN_NAME}-${TIMESTAMP}.txt"
 RAW_LOG="$TMP_ROOT/raw.log"

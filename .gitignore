@@ -19,6 +19,10 @@ research-data/
 # Personal session logs and workflow
 SESSION-*.md
 session-log-template.md
+# Internal audit-progress docs — reference private findings (F0x), audited
+# slugs, and plugin-specific results. Tools ship; this planning context does not.
+ROADMAP.md
+SCREENER-COVERAGE-GAPS.md
 batch-audit.sh
 batch-prompt.md
 batch-run.log

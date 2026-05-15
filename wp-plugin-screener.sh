@@ -255,28 +255,90 @@ for arg in "$@"; do
 done
 
 if [ "$EXCLUDE_VENDORED" = "1" ]; then
-    PHP_FILES=$(find "$TARGET_DIR" -type f -name '*.php' \
-                  -not -path '*/vendor/*' \
-                  -not -path '*/vendor-prod/*' \
-                  -not -path '*/vendor_prefixed/*' \
-                  -not -path '*/node_modules/*' \
-                  -not -path '*/dist/*' \
-                  -not -path '*/build/*' \
+    # Known vendored library subdirs under lib/. Many plugins put their own
+    # code under lib/ (so we don't blanket-exclude lib/*) but a handful of
+    # third-party libraries get dropped there: Nusoap, PclZip, PHPMailer,
+    # Smarty, Twig, OAuth, getID3, ICalEasyReader. Extend this list when
+    # new false-positive-prone vendored libs appear.
+    #
+    # AUTO-DETECT bundled vendor PHP libs at ANY depth (not just under lib/).
+    # Real-world case: a `*-php-lib/` SDK bundled at plugin root produced
+    # ~13 NOPRIV HIGH false positives from its CI scripts. Heuristic:
+    # a subdir containing composer.json AND (name matches *-php-lib / *-php /
+    # *-sdk / *-lib / *-client / php-* pattern OR a LICENSE file is present)
+    # is treated as a vendored library and excluded. Plugin's own top-level
+    # composer.json is NOT considered (it's the plugin's manifest, not a vendor).
+    AUTO_VENDOR_DIRS=$(find "$TARGET_DIR" -mindepth 2 -maxdepth 4 -type f -name 'composer.json' 2>/dev/null | \
+        while read -r cj; do
+            d=$(dirname "$cj")
+            # Skip already-excluded canonical paths
+            case "$d" in
+                */vendor|*/vendor/*|*/node_modules|*/node_modules/*) continue ;;
+            esac
+            bn=$(basename "$d")
+            case "$bn" in
+                *-php-lib|*-php|*-sdk|*-lib|*-client|php-*|*-sdk-php)
+                    echo "$d" ;;
+                *)
+                    # Has LICENSE/LICENSE.md/LICENSE.txt → bundled vendor library
+                    if [ -f "$d/LICENSE" ] || [ -f "$d/LICENSE.md" ] || [ -f "$d/LICENSE.txt" ]; then
+                        echo "$d"
+                    fi ;;
+            esac
+        done | sort -u)
+    AUTO_VENDOR_PRUNE=""
+    if [ -n "$AUTO_VENDOR_DIRS" ]; then
+        while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            AUTO_VENDOR_PRUNE="$AUTO_VENDOR_PRUNE -not -path '$d/*'"
+        done <<<"$AUTO_VENDOR_DIRS"
+    fi
+
+    PHP_FILES=$(eval find "$TARGET_DIR" -type f -name "'*.php'" \
+                  -not -path "'*/vendor/*'" \
+                  -not -path "'*/vendor-prod/*'" \
+                  -not -path "'*/vendor_prefixed/*'" \
+                  -not -path "'*/vendor-prefixed/*'" \
+                  -not -path "'*/node_modules/*'" \
+                  -not -path "'*/dist/*'" \
+                  -not -path "'*/build/*'" \
+                  -not -path "'*/lib/Nusoap/*'" \
+                  -not -path "'*/lib/PclZip/*'" \
+                  -not -path "'*/lib/Pclzip/*'" \
+                  -not -path "'*/lib/PHPMailer/*'" \
+                  -not -path "'*/lib/phpmailer/*'" \
+                  -not -path "'*/lib/Smarty/*'" \
+                  -not -path "'*/lib/Twig/*'" \
+                  -not -path "'*/lib/getID3/*'" \
+                  -not -path "'*/lib/getid3/*'" \
+                  -not -path "'*/lib/OAuth/*'" \
+                  -not -path "'*/lib/oauth/*'" \
+                  -not -path "'*/lib/ICalEasyReader/*'" \
+                  -not -path "'*/lib/composer/*'" \
+                  $AUTO_VENDOR_PRUNE \
                   2>/dev/null)
     JS_FILES=$(find "$TARGET_DIR" -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.vue' \) \
                   -not -path '*/vendor/*' \
                   -not -path '*/vendor-prod/*' \
                   -not -path '*/vendor_prefixed/*' \
+                  -not -path '*/vendor-prefixed/*' \
                   -not -path '*/node_modules/*' \
                   -not -path '*/dist/*' \
                   -not -path '*/build/*' \
                   -not -name '*.min.js' \
                   2>/dev/null)
     PHP_VENDOR_FILES=$(find "$TARGET_DIR" -type f -name '*.php' \
-                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/vendor_prefixed/*' -o -path '*/dist/*' -o -path '*/build/*' \) \
+                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/vendor_prefixed/*' -o -path '*/vendor-prefixed/*' \
+                     -o -path '*/dist/*' -o -path '*/build/*' \
+                     -o -path '*/lib/Nusoap/*' -o -path '*/lib/PclZip/*' -o -path '*/lib/Pclzip/*' \
+                     -o -path '*/lib/PHPMailer/*' -o -path '*/lib/phpmailer/*' \
+                     -o -path '*/lib/Smarty/*' -o -path '*/lib/Twig/*' \
+                     -o -path '*/lib/getID3/*' -o -path '*/lib/getid3/*' \
+                     -o -path '*/lib/OAuth/*' -o -path '*/lib/oauth/*' \
+                     -o -path '*/lib/ICalEasyReader/*' -o -path '*/lib/composer/*' \) \
                   2>/dev/null)
     JS_VENDOR_FILES=$(find "$TARGET_DIR" -type f \( -name '*.js' -o -name '*.jsx' \) \
-                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/vendor_prefixed/*' -o -path '*/dist/*' -o -path '*/build/*' -o -name '*.min.js' \) \
+                  \( -path '*/vendor/*' -o -path '*/vendor-prod/*' -o -path '*/vendor_prefixed/*' -o -path '*/vendor-prefixed/*' -o -path '*/dist/*' -o -path '*/build/*' -o -name '*.min.js' \) \
                   2>/dev/null)
 else
     PHP_FILES=$(find "$TARGET_DIR" -type f -name '*.php' 2>/dev/null)
@@ -682,14 +744,21 @@ _populate_file_cache() {
     # Awk script: tracks current function span and caps within. Emits one
     # record per function when the function ends (next function starts OR
     # EOF). Also counts file-level admin vs public hook patterns.
+    # Record format (added 2026-05-15): F|<start>|<end>|<func_name>|<caps_csv>|<floor>|<wrapper_calls_csv>
+    # wrapper_calls_csv lists permission-wrapper helper function names called
+    # in the function body (verify_*, check_*, is_admin*, can_*, require_*,
+    # ensure_*). classify_auth_band uses these for multi-hop band resolution
+    # (fixes the pattern where handler → verify_access() → is_admin_user()
+    # → current_user_can('delete_users') was missed by the 1-hop classifier
+    # and produced SUBSCRIBER-band FPs on admin-only handlers).
     local awk_out
     awk_out=$(awk '
-        BEGIN { in_func=0; func_start=0; func_name=""; caps=""; floor=0; admin_hooks=0; pub_hooks=0 }
+        BEGIN { in_func=0; func_start=0; func_name=""; caps=""; floor=0; admin_hooks=0; pub_hooks=0; wrapper_calls="" }
         function emit() {
             if (in_func) {
-                printf "F|%d|%d|%s|%s|%d\n", func_start, NR - 1, func_name, caps, floor
+                printf "F|%d|%d|%s|%s|%d|%s\n", func_start, NR - 1, func_name, caps, floor, wrapper_calls
             }
-            in_func=0; caps=""; floor=0
+            in_func=0; caps=""; floor=0; wrapper_calls=""
         }
         # Detect function start
         /^[[:space:]]*(public|private|protected|static|final|abstract)?[[:space:]]*(public|private|protected|static|final|abstract)?[[:space:]]*function[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\(/ {
@@ -715,6 +784,20 @@ _populate_file_cache() {
             }
             if (/is_user_logged_in[[:space:]]*\(\)|check_ajax_referer|check_admin_referer|wp_verify_nonce/) {
                 floor = 1
+            }
+            # Permission-wrapper helper calls: verify_*, check_*, can_*,
+            # is_admin*, require_*, ensure_*. The function-name pattern is the
+            # signal — if the body calls one of these, the band depends on
+            # what the wrapper enforces. classify_auth_band resolves to ADMIN
+            # for admin-suffixed wrappers and SUBSCRIBER otherwise (still
+            # better than UNKNOWN).
+            wline = $0
+            while (match(wline, /(\$this->|self::|static::|[a-zA-Z_][a-zA-Z0-9_]*::)?(verify_[a-zA-Z_]+|check_[a-zA-Z_]+|can_[a-zA-Z_]+|is_admin[a-zA-Z_]*|require_[a-zA-Z_]+|ensure_[a-zA-Z_]+)[[:space:]]*\(/)) {
+                wm = substr(wline, RSTART, RLENGTH)
+                # Strip the call prefix and `(`
+                sub(/^.*->/, "", wm); sub(/^[^:]*::/, "", wm); sub(/[[:space:]]*\($/, "", wm)
+                if (wrapper_calls == "") wrapper_calls = wm; else if (index(wrapper_calls, wm) == 0) wrapper_calls = wrapper_calls "," wm
+                wline = substr(wline, RSTART + RLENGTH)
             }
         }
         # Hook counters (file-level — count regardless of in_func).
@@ -757,12 +840,12 @@ classify_auth_band() {
 
     _populate_file_cache "$file"
 
-    local rec func_name caps floor start end
+    local rec func_name caps floor start end wrapper_calls
     local matched_record=""
     while IFS= read -r rec; do
         [ -z "$rec" ] && continue
-        # rec format: F|<start>|<end>|<func_name>|<caps_csv>|<has_login_floor>
-        IFS='|' read -r _tag start end func_name caps floor <<< "$rec"
+        # rec format: F|<start>|<end>|<func_name>|<caps_csv>|<floor>|<wrapper_calls_csv>
+        IFS='|' read -r _tag start end func_name caps floor wrapper_calls <<< "$rec"
         if [ "$lineno" -ge "$start" ] && [ "$lineno" -le "$end" ]; then
             matched_record="$rec"
             break
@@ -782,11 +865,17 @@ classify_auth_band() {
         echo "NOPRIV"; return
     fi
 
-    # AJAX handler lookup (O(1)).
+    # AJAX handler lookup (O(1)). NOPRIV is authoritative — unauth dispatch
+    # can't be undone by a body cap check. SUBSCRIBER is just the priv-AJAX
+    # default; if the body contains a more-restrictive cap (manage_options →
+    # ADMIN, edit_others_posts → EDITOR), that cap wins because the meaningful
+    # body code is gated by it. We let the body-cap inspection below run and
+    # then combine.
+    local ajax_band=""
     if [ -n "$func_name" ]; then
-        local ajax_band="${AJAX_HANDLER_BAND[$func_name]:-}"
-        if [ -n "$ajax_band" ]; then
-            echo "$ajax_band"; return
+        ajax_band="${AJAX_HANDLER_BAND[$func_name]:-}"
+        if [ "$ajax_band" = "NOPRIV" ]; then
+            echo "NOPRIV"; return
         fi
     fi
 
@@ -817,8 +906,123 @@ classify_auth_band() {
         done
     fi
 
+    # Combine ajax_band with body-cap shallowest. The effective band is the
+    # MORE-RESTRICTIVE (higher-rank) of the two — the band classifier asks
+    # "what's the lowest role that can actually reach a sink in this fn?",
+    # not "what's the lowest role that can dispatch this fn?". A priv-AJAX
+    # handler whose body checks manage_options is effectively ADMIN, not
+    # SUBSCRIBER.
     if [ "$shallowest_band" != "UNKNOWN" ]; then
+        if [ -n "$ajax_band" ]; then
+            local ajax_rank="${BAND_RANK[$ajax_band]:-99}"
+            if [ "$shallowest_rank" -gt "$ajax_rank" ]; then
+                echo "$shallowest_band"; return    # body cap is more restrictive
+            fi
+            echo "$ajax_band"; return               # ajax_band is more restrictive
+        fi
         echo "$shallowest_band"; return
+    fi
+
+    # Wrapper-call resolution (4D, 2026-05-15). When the function body has no
+    # direct cap but DOES call a permission-wrapper helper (verify_*, check_*,
+    # is_admin*, can_*, require_*, ensure_*), infer band from the wrapper name.
+    # This is a heuristic — the *correct* fix would chase through call
+    # boundaries to find current_user_can — but name conventions are reliable
+    # enough that this catches the common SUBSCRIBER→ADMIN FP shape (e.g.
+    # handler → verify_access → is_admin_user →
+    # current_user_can('delete_users')). The wrapper name
+    # contains the auth tier; if it doesn't, we conservatively raise to
+    # SUBSCRIBER (any logged-in user has at minimum been gated).
+    #
+    # 1-hop transitive expansion (same-file): if a wrapper-call name resolves
+    # to a function in the SAME file, inline ITS wrapper_calls + caps. This
+    # catches the pattern where a generic-named wrapper (e.g. verify_access,
+    # which would classify SUBSCRIBER on its own) itself calls an admin-tier
+    # helper (e.g. can_modify_settings). Without this, the handler stays
+    # mis-classified as SUBSCRIBER.
+    if [ -n "$wrapper_calls" ]; then
+        local _expanded_wrappers="$wrapper_calls"
+        local _expanded_caps="$caps"
+        local _w_rec _w_name _w_caps _w_wrappers _w_inner
+        # Walk each wrapper-call name; find its function record in this file;
+        # if found, append its caps + wrapper_calls. Single level only.
+        IFS=',' read -r -a _walk_arr <<< "$wrapper_calls"
+        for _w_name in "${_walk_arr[@]}"; do
+            [ -z "$_w_name" ] && continue
+            while IFS= read -r _w_rec; do
+                [ -z "$_w_rec" ] && continue
+                IFS='|' read -r _wt _ws _we _wfn _wcaps _wfl _wwraps <<< "$_w_rec"
+                if [ "$_wfn" = "$_w_name" ]; then
+                    [ -n "$_wcaps" ] && _expanded_caps="${_expanded_caps:+$_expanded_caps,}$_wcaps"
+                    [ -n "$_wwraps" ] && _expanded_wrappers="$_expanded_wrappers,$_wwraps"
+                    break
+                fi
+            done <<< "${FILE_FUNC_DATA[$file]}"
+        done
+        # Re-run direct cap → band derivation with the expanded caps set.
+        if [ -n "$_expanded_caps" ] && [ "$_expanded_caps" != "$caps" ]; then
+            local _x_cap _x_band _x_rank _x_shallowest=99 _x_band_result="UNKNOWN"
+            IFS=',' read -r -a _x_arr <<< "$_expanded_caps"
+            for _x_cap in "${_x_arr[@]}"; do
+                [ -z "$_x_cap" ] && continue
+                _x_band="${STD_CAP_BAND[$_x_cap]:-}"
+                [ -z "$_x_band" ] && _x_band="${CUSTOM_CAP_BAND[$_x_cap]:-}"
+                [ -z "$_x_band" ] && continue
+                _x_rank="${BAND_RANK[$_x_band]:-99}"
+                if [ "$_x_rank" -lt "$_x_shallowest" ]; then
+                    _x_shallowest="$_x_rank"; _x_band_result="$_x_band"
+                fi
+            done
+            if [ "$_x_band_result" != "UNKNOWN" ]; then
+                # Found a real cap via 1-hop expansion → return that band.
+                echo "$_x_band_result"; return
+            fi
+        fi
+        # Otherwise fall back to wrapper-NAME heuristic on the expanded set.
+        # In BAND_RANK semantics: NOPRIV=0, SUBSCRIBER=1, AUTHOR=2, EDITOR=3,
+        # ADMIN=4. Higher rank = more restrictive. We pick the MOST restrictive
+        # (highest rank) band among the wrapper-names.
+        wrapper_calls="$_expanded_wrappers"
+        local wrap _wname_band _wname_rank wrap_best_rank=-1 wrap_best_band=""
+        IFS=',' read -r -a _wrap_arr <<< "$wrapper_calls"
+        for wrap in "${_wrap_arr[@]}"; do
+            [ -z "$wrap" ] && continue
+            _wname_band=""
+            case "$wrap" in
+                # ADMIN tier — names that strongly imply admin-only enforcement
+                is_admin*|verify_admin*|check_admin*|require_admin*|ensure_admin*|can_manage*|verify_manage*|check_manage*|require_manage*|can_modify_settings|verify_capabilities|require_capabilities|can_administer*)
+                    _wname_band="ADMIN" ;;
+                # EDITOR tier
+                verify_editor*|check_editor*|require_editor*|can_edit_others*)
+                    _wname_band="EDITOR" ;;
+                # AUTHOR tier — post-publishing wrappers
+                verify_author*|check_author*|require_author*|can_publish*)
+                    _wname_band="AUTHOR" ;;
+                # Nonce-only checks (verify_nonce, check_nonce) are not auth gates,
+                # they are CSRF gates. Skip them entirely.
+                verify_nonce|check_nonce|check_ajax_referer|check_admin_referer) continue ;;
+                # Anything else (verify_access, check_perms, ensure_logged_in,
+                # can_send_notifications) is too generic — SUBSCRIBER floor.
+                *) _wname_band="SUBSCRIBER" ;;
+            esac
+            _wname_rank="${BAND_RANK[$_wname_band]:-99}"
+            if [ "$_wname_rank" != "99" ] && [ "$_wname_rank" -gt "$wrap_best_rank" ]; then
+                wrap_best_rank="$_wname_rank"; wrap_best_band="$_wname_band"
+            fi
+        done
+        # Apply only if more restrictive than the ajax_band (priv-AJAX = SUBSCRIBER, rank 1).
+        if [ -n "$wrap_best_band" ]; then
+            local _ajax_rank="${BAND_RANK[$ajax_band]:-0}"
+            if [ "$wrap_best_rank" -gt "$_ajax_rank" ]; then
+                echo "$wrap_best_band"; return
+            fi
+        fi
+    fi
+
+    # No body cap found. If ajax_band is set (SUBSCRIBER for priv-AJAX with
+    # no body cap), that's the answer.
+    if [ -n "$ajax_band" ]; then
+        echo "$ajax_band"; return
     fi
 
     # No cap, but has nonce / is_user_logged_in floor → SUBSCRIBER.
@@ -908,12 +1112,12 @@ scan_pattern_php HIGH "file write / upload" \
 #       argument list of the sink directly. Highest precision, lowest recall.
 #   11b (block below) — sink call takes a variable; the variable traces back
 #       through up to two assignment hops within the same function to a
-#       superglobal read. Catches the indirect form seen in Pirate Forms
-#       (line 1245-46: `$dir_new = ...$form_id...` / `wp_mkdir_p($dir_new)`).
+#       superglobal read. Catches the indirect form
+#       (`$dir = ...$form_id...` / `wp_mkdir_p($dir)`).
 #
-# This pattern matches the Pirate Forms 2.6.1 finding
-# (public/class-pirateforms-public.php:1245-46) and Forminator CVE-2025-6463
-# (file deletion via entry-id from $_POST).
+# This pattern matches the common "path built from a request id then passed
+# to a write/delete sink" shape (e.g. directory-create from a form id, or
+# file deletion via an entry id from $_POST).
 #
 # Higher confidence than Rule 5: Rule 5 just says "there's a file write
 # anywhere in the file"; Rule 11 says "the write argument contains
@@ -950,12 +1154,11 @@ fi
 # 1-2 assignment hops within the same enclosing function. Uses the function
 # span cache built by _populate_file_cache so we don't re-walk the file.
 #
-# Examples it catches (and the bug class):
-#   Pirate Forms 2.6.1, public/class-pirateforms-public.php:1245-46
-#     $form_id  = $_POST['pirate_forms_form_id'];   // upstream (somewhere in same fn)
+# Example shape it catches (and the bug class):
+#     $form_id  = $_POST['form_id'];                // upstream (somewhere in same fn)
 #     $dir_new  = $this->...( "saved/$form_id" );   // 1-hop var
 #     wp_mkdir_p( $dir_new );                       // sink — Rule 11b fires HERE
-#   Forminator <= 1.44.2, entry deletion: same shape, deletion side.
+#   Entry-deletion-by-id variant: same shape, deletion side (unlink/wp_delete_file).
 #
 # Bounded to 2 hops to keep cost predictable. Real flow analysis is v0.2.
 if [ -n "$PHP_FILES" ]; then
@@ -1024,6 +1227,266 @@ if [ -n "$PHP_FILES" ]; then
             add_finding HIGH "path/file sink <- superglobal (2-hop via \$$hit)" "$file:$lineno" "$content"
         fi
     done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "$sink_var_re" 2>/dev/null || true)
+fi
+
+# 15a. Arbitrary options update — option NAME from a superglobal.
+# Pattern: update_option($_POST['key'], …)
+#          add_option($_GET['x'], …)
+#          update_site_option($_REQUEST['name'], …)
+# When the attacker controls the option NAME (not the value), they can overwrite
+# any wp_options row — siteurl, home, default_role, users_can_register,
+# admin_email, template, stylesheet, active_plugins. That's site takeover.
+#
+# Inline guard: a same-line `sanitize_key`/`sanitize_text_field` wrap on the key
+# does NOT make this safe — those normalize characters but don't restrict the
+# key to an allowlist. The only safe shape is an explicit whitelist check
+# (in_array / switch). Allowlist is harder to detect on a single line, so we
+# emit and let auth-banding + the auditor decide.
+scan_pattern_php HIGH "update_option w/ user-controlled key" \
+    "(^|[^[:alnum:]_>])(update_option|add_option|update_site_option)[[:space:]]*\([[:space:]]*\\\$_(GET|POST|REQUEST)\["
+
+# 15b. Arbitrary user/post/term meta update — meta KEY from a superglobal.
+# Pattern: update_user_meta($id, $_POST['meta_key'], $value)
+# The meta key is the 2nd positional argument. Require the SECOND arg (after the
+# first comma) to be a bare superglobal — not just "any superglobal somewhere
+# after the first comma," which would also match the value-from-superglobal
+# shape (just an XSS/storage sink, not arbitrary-meta-write).
+#
+# Severity MEDIUM not HIGH because meta keys are scoped per object_id; the blast
+# radius is smaller than wp_options (no `siteurl` equivalent). Still worth a
+# look: `_capabilities`, `wp_user_level`, `session_tokens` all live in user_meta.
+scan_pattern_php MEDIUM "update_meta w/ user-controlled key" \
+    "(^|[^[:alnum:]_>])(update_user_meta|update_post_meta|update_term_meta|add_user_meta|add_post_meta|add_term_meta)[[:space:]]*\([^,]*,[[:space:]]*\\\$_(GET|POST|REQUEST)\["
+
+# 14a. Privilege escalation via wp_update_user / wp_insert_user with role from
+# a superglobal. Multi-line aware: the array literal usually spans several
+# lines, so we scan a ~30-line window from each call site for the dangerous
+# `'role' => $_POST/...` shape.
+#
+# Pattern recognized:
+#   wp_update_user([
+#       'ID'   => $uid,
+#       'role' => $_POST['role'],   // <-- attacker chooses role
+#   ]);
+# Same pattern with double quotes or unquoted bareword `role` key.
+#
+# Corpus calibration (2026-05-14, 25 plugins): 6 call sites, 0 with this shape.
+# Expected new FPs: ~0.
+if [ -n "$PHP_FILES" ]; then
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        end=$((lineno + 30))
+        window=$(sed -n "${lineno},${end}p" "$file" 2>/dev/null)
+        hit=$(echo "$window" | grep -nE "['\"]?role['\"]?[[:space:]]*=>[[:space:]]*\\\$_(GET|POST|REQUEST)\[" | head -1)
+        [ -z "$hit" ] && continue
+        off="${hit%%:*}"
+        case "$off" in ''|*[!0-9]*) off=1 ;; esac
+        actual=$((lineno + off - 1))
+        evidence=$(echo "$hit" | cut -d: -f2-)
+        add_finding HIGH "user role from superglobal" "$file:$actual" "$evidence"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "(^|[^[:alnum:]_>])(wp_update_user|wp_insert_user)[[:space:]]*\(" 2>/dev/null || true)
+fi
+
+# 14b. ->set_role / ->add_cap / ->remove_cap with a superglobal argument.
+# The dangerous shape is `$user->set_role($_POST['role'])` — attacker dictates
+# the role directly. Bare `$variable` args are too noisy (plugin install code
+# iterates over its own cap list); we restrict to superglobal-direct.
+#
+# Corpus calibration: 0 hits across 25 plugins (no plugin sets role/caps from
+# raw superglobals in our audited sample). Expected new FPs: ~0.
+scan_pattern_php HIGH "->set_role/->add_cap w/ superglobal" \
+    "[a-zA-Z0-9_]->[[:space:]]*(set_role|add_cap|remove_cap)[[:space:]]*\([[:space:]]*\\\$_(GET|POST|REQUEST)\["
+
+# 14c. wp_set_current_user / wp_set_auth_cookie with a user-id directly from a
+# superglobal. Pattern: `wp_set_auth_cookie($_POST['user_id'])`.
+#
+# The bare-variable form (`wp_set_auth_cookie($user_id)`) is excluded because
+# every legitimate login flow uses it after a password check — 9 such calls in
+# the corpus, all benign post-auth uses. A 1-hop trace to a superglobal is the
+# right next step but is deferred (Rule 11b-style work).
+#
+# Corpus calibration: 0 hits with direct-superglobal arg. Expected new FPs: ~0.
+scan_pattern_php HIGH "wp_set_current_user/auth_cookie w/ superglobal" \
+    "(wp_set_current_user|wp_set_auth_cookie)[[:space:]]*\([[:space:]]*\\\$_(GET|POST|REQUEST)\["
+
+# 18. SSRF — wp_remote_* with a superglobal directly in the URL position.
+# Pattern: wp_remote_get($_POST['url']), wp_remote_post($_GET['endpoint'], ...)
+# Corpus calibration: 0 first-party hits (clean plugins).
+scan_pattern_php HIGH "SSRF wp_remote_ w/ superglobal" \
+    "wp_remote_(get|post|request|head|fopen)[[:space:]]*\([[:space:]]*\\\$_(GET|POST|REQUEST)\["
+
+# 19. Mass assignment via extract() on superglobal — overwrites arbitrary PHP
+# variables in the current scope. CWE-915 / AP-030.
+# Corpus calibration: 0 first-party hits.
+scan_pattern_php HIGH "extract on superglobal (mass assignment)" \
+    "(^|[^[:alnum:]_])extract[[:space:]]*\([[:space:]]*\\\$_(GET|POST|REQUEST)"
+
+# 20. Open redirect via wp_redirect (not wp_safe_redirect) with superglobal.
+# wp_safe_redirect enforces host allowlist; wp_redirect does not.
+# Corpus calibration: 0 first-party hits.
+scan_pattern_php HIGH "wp_redirect w/ superglobal (open redirect)" \
+    "(^|[^[:alnum:]_])wp_redirect[[:space:]]*\([[:space:]]*\\\$_(GET|POST|REQUEST)\["
+
+# 21. Arbitrary file delete with superglobal in path (CWE-552).
+# Skip method definitions (`function unlink(`).
+# Corpus calibration: 0 first-party hits.
+if [ -n "$PHP_FILES" ]; then
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        echo "$content" | grep -qE "function[[:space:]]+(unlink|wp_delete_file|rmdir)[[:space:]]*\(" && continue
+        echo "$content" | grep -qE "(->|::)[[:space:]]*(unlink|wp_delete_file|rmdir)[[:space:]]*\(" && continue
+        add_finding HIGH "file delete w/ superglobal" "$file:$lineno" "$content"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "(^|[^[:alnum:]_>])(unlink|wp_delete_file|rmdir)[[:space:]]*\([^)]*\\\$_(GET|POST|REQUEST)\[" 2>/dev/null || true)
+fi
+
+# 22. Arbitrary file read with superglobal in path (BC-69 / CWE-200/22).
+# file_get_contents / readfile / fread / fpassthru / show_source / highlight_file.
+# Skip method definitions and method/static calls.
+# Corpus calibration: 0 first-party hits.
+if [ -n "$PHP_FILES" ]; then
+    file_read_sinks='(file_get_contents|readfile|fread|fpassthru|show_source|highlight_file)'
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        echo "$content" | grep -qE "function[[:space:]]+${file_read_sinks}[[:space:]]*\(" && continue
+        echo "$content" | grep -qE "(->|::)[[:space:]]*${file_read_sinks}[[:space:]]*\(" && continue
+        add_finding HIGH "file read w/ superglobal" "$file:$lineno" "$content"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "(^|[^[:alnum:]_>])${file_read_sinks}[[:space:]]*\([^)]*\\\$_(GET|POST|REQUEST)\[" 2>/dev/null || true)
+fi
+
+# 12. Broad RCE sinks beyond eval/unserialize (Rules 2/3 already handle those).
+#   12a — system/exec/shell_exec/passthru/popen/proc_open with a variable arg.
+#         The danger is shell interpolation: `exec("find $dir ...")` where $dir
+#         can be attacker-influenced. Filters:
+#           - skip `function exec(` definitions (member-fn collision)
+#           - skip `->name(` and `::name(` calls (member/static methods named
+#             the same — common in Curl wrappers, regex matchers, etc.)
+#           - skip comments (handled by is_comment_line)
+#   12b — create_function: deprecated PHP <7.2 code-from-string. Always HIGH.
+#   12c — preg_replace with the /e modifier (CWE-94). Tight regex: requires
+#         the pattern literal to end with delimiter + modifier-string-with-e.
+#
+# Corpus calibration (2026-05-14, 25 plugins, vendored excluded):
+#   12a: 1 match (sg-cachepress exec with $basedir from server config — auditor
+#        confirms FP since basedir is admin-controlled, not user-controlled)
+#   12b: 0 matches (no create_function in any plugin)
+#   12c: 0 matches (no /e-flag preg_replace)
+if [ -n "$PHP_FILES" ]; then
+    rce_sinks='(system|exec|shell_exec|passthru|popen|proc_open)'
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        # Skip method definitions: `public function exec(`, `function exec(`
+        echo "$content" | grep -qE "function[[:space:]]+(system|exec|shell_exec|passthru|popen|proc_open)[[:space:]]*\(" && continue
+        # Skip method/static calls: `->exec(`, `::exec(`, `\Namespace\exec(` (the leading `\` is the namespace-root prefix used in vendor_prefixed code we already exclude, but some first-party code does it too)
+        echo "$content" | grep -qE "(->|::)[[:space:]]*(system|exec|shell_exec|passthru|popen|proc_open)[[:space:]]*\(" && continue
+        add_finding HIGH "RCE sink (variable arg)" "$file:$lineno" "$content"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "(^|[^[:alnum:]_>])${rce_sinks}[[:space:]]*\([^)]*\\\$" 2>/dev/null || true)
+fi
+
+# 13. Dynamic include / require with a user-controlled path (LFI → RCE).
+# Pattern: include $_GET['page'] . '.php';  require_once $_POST['template'];
+# WordPress core uses ABSPATH/__DIR__/dirname-prefixed includes; any
+# superglobal in the path is suspicious. Matches both function-call form
+# `include('x')` and statement form `include 'x';`.
+#
+# Corpus calibration: 0 first-party hits.
+scan_pattern_php HIGH "dynamic include from superglobal (LFI->RCE)" \
+    "(^|[^[:alnum:]_])(include|require|include_once|require_once)([[:space:]]+|\()[^;]*\\\$_(GET|POST|REQUEST|COOKIE)\["
+
+# 17. Dynamic dispatch with attacker-controlled callable name.
+#   17a — $obj->{$_POST['method']}() or $obj->{$_POST['m']}[0]
+#   17b — call_user_func / call_user_func_array with superglobal as callable.
+# Both let the attacker pick any callable reachable on the object/class.
+#
+# Corpus calibration: 0 first-party hits.
+scan_pattern_php HIGH "dynamic method dispatch from superglobal" \
+    "[a-zA-Z0-9_]->[[:space:]]*\{[[:space:]]*\\\$_(GET|POST|REQUEST)\["
+scan_pattern_php HIGH "call_user_func w/ superglobal callable" \
+    "(^|[^[:alnum:]_])call_user_func(_array)?[[:space:]]*\([[:space:]]*\\\$_(GET|POST|REQUEST)\["
+
+# 12b. create_function — removed in PHP 8.0; presence in modern code is a smell.
+scan_pattern_php HIGH "create_function (deprecated, RCE risk)" \
+    "(^|[^[:alnum:]_>])create_function[[:space:]]*\("
+
+# 12c. preg_replace with /e modifier. The pattern literal ends in
+# delimiter + alphabetic-modifier-string-containing-e. Delimiters covered:
+# / # ~ @ ! | (the common PCRE delimiters). Excludes the trivial "regex
+# happens to contain the letter e in the middle" case.
+scan_pattern_php HIGH "preg_replace /e flag (CWE-94)" \
+    "preg_replace[[:space:]]*\([[:space:]]*['\"][/#~@!|][^'\"]+[/#~@!|][imsuADJSUXJ]*e[imsuADJSUXJ]*['\"]"
+
+# 16. WP upload-handler sinks with no MIME/extension restriction visible in
+# the enclosing function. Patterns:
+#   wp_handle_upload($_FILES['x'], $overrides)
+#   wp_handle_sideload(...)
+#   media_handle_upload('field', $post_id)
+#   media_handle_sideload($file_array, $post_id)
+#   media_sideload_image($url, $post_id, ...)
+#   media_sideload_file($url, $post_id, ...)
+#
+# WP core enforces a default mime allowlist, but the dangerous shapes are:
+#  (a) `'test_type' => false` in $overrides — disables MIME check entirely.
+#  (b) `'mimes' => array(...)` that includes svg/json/etc — widens the allow-
+#      list to types with XSS or RCE potential.
+#  (c) No follow-up wp_check_filetype on the returned ['file'] before
+#      moving/serving — relies on WP's default to do the right thing.
+#
+# Detection: for each call site, slice the enclosing function (or ±50 lines
+# fallback) and check for one of: `wp_check_filetype`, `'mimes'` array key,
+# `wp_check_filetype_and_ext`, explicit `pathinfo(...PATHINFO_EXTENSION)`
+# check, in_array(... allowed_extensions). Absence -> MEDIUM (the call exists,
+# walk it). HIGH would over-fire on safe wp-default-mime callers; MEDIUM
+# leaves auditor judgment intact.
+#
+# Corpus calibration (2026-05-14, 25 plugins): 7 call sites across 4 plugins.
+# Expected emit count: ~5 MEDIUM (the multi-step-form admin caller has a
+# downstream wp_check_filetype and would be silenced).
+if [ -n "$PHP_FILES" ]; then
+    upload_re='(^|[^[:alnum:]_])(wp_handle_upload|wp_handle_sideload|media_handle_upload|media_handle_sideload|media_sideload_image|media_sideload_file)[[:space:]]*\('
+    check_re="wp_check_filetype|wp_check_filetype_and_ext|['\"]mimes['\"][[:space:]]*=>|PATHINFO_EXTENSION|in_array[[:space:]]*\([^)]*(jpg|png|gif|pdf|json|svg|csv|xml|zip)"
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        # Slice enclosing function from the cache if available, else ±50 lines.
+        _populate_file_cache "$file"
+        func_start=0; func_end=0
+        while IFS= read -r rec; do
+            [ -z "$rec" ] && continue
+            IFS='|' read -r _tag _s _e _ _ _ <<< "$rec"
+            if [ "$lineno" -ge "$_s" ] && [ "$lineno" -le "$_e" ]; then
+                func_start="$_s"; func_end="$_e"
+                break
+            fi
+        done <<< "${FILE_FUNC_DATA[$file]}"
+        if [ "$func_start" = "0" ]; then
+            func_start=$((lineno - 25)); [ $func_start -lt 1 ] && func_start=1
+            func_end=$((lineno + 25))
+        fi
+        window=$(sed -n "${func_start},${func_end}p" "$file" 2>/dev/null)
+        # If a MIME/extension restriction is visible in the window, suppress.
+        if echo "$window" | grep -qE -e "$check_re"; then
+            continue
+        fi
+        add_finding MEDIUM "upload handler w/o MIME check" "$file:$lineno" "$content"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "$upload_re" 2>/dev/null || true)
 fi
 
 # 6. wp_localize_script / wp_add_inline_script with secrets — multi-line aware.
@@ -1203,6 +1666,153 @@ if [ -n "$PHP_FILES" ]; then
         add_finding "$sev" "ajax handler missing cap/nonce" "$deffile:$defline" "function ${cb}(...) — no current_user_can / nonce check" "$band"
     done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "add_action[[:space:]]*\([[:space:]]*['\"]wp_ajax_" 2>/dev/null \
               | awk '/wp_ajax_nopriv_/ {n=n $0 "\n"; next} {p=p $0 "\n"} END {printf "%s%s", n, p}' || true)
+fi
+
+echo
+
+# 23. register_setting() without sanitize_callback (AP-052 / BC-27).
+# Settings API saves raw user input to wp_options when no sanitize_callback
+# is provided. Often paired with options-page output that doesn't escape.
+# Multi-line call patterns are common; we window each call and check the
+# 30-line span for the 'sanitize_callback' key.
+# Skip if window contains explicit 'type' => 'integer'/'boolean' (those types
+# get implicit casting; not bulletproof but lower risk than no type at all).
+if [ -n "$PHP_FILES" ]; then
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        # Bound window to THIS register_setting call — stop at next call in
+        # the same file (or 30 lines, whichever is first). Without this bound,
+        # adjacent calls' windows overlap and a later call's sanitize_callback
+        # falsely suppresses the earlier call.
+        next_line=$(awk -v start=$((lineno + 1)) 'NR >= start && /register_setting[[:space:]]*\(/ {print NR; exit}' "$file")
+        end=$((lineno + 30))
+        if [ -n "$next_line" ] && [ "$next_line" -lt "$end" ]; then
+            end=$((next_line - 1))
+        fi
+        window=$(sed -n "${lineno},${end}p" "$file" 2>/dev/null)
+        # Has sanitize_callback key (modern WP 4.7+ args form) → safe
+        echo "$window" | grep -qE -e "['\"]sanitize_callback['\"][[:space:]]*=>" && continue
+        # Pre-WP-4.7 form: 3rd positional arg is a callable directly.
+        # Common shapes: array($this, 'method'), [$this, 'method'], 'function_name'
+        # (when 3 args present in the call line itself).
+        if echo "$window" | grep -qE -e "register_setting[[:space:]]*\([^)]*,[[:space:]]*(array[[:space:]]*\([[:space:]]*\\\$this|\[[[:space:]]*\\\$this)"; then
+            continue
+        fi
+        # Has explicit type → lower risk, still surface as LOW
+        if echo "$window" | grep -qE -e "['\"]type['\"][[:space:]]*=>[[:space:]]*['\"](integer|boolean|number)['\"]"; then
+            add_finding LOW "register_setting w/ typed but no sanitize_callback" "$file:$lineno" "$content"
+            continue
+        fi
+        add_finding MEDIUM "register_setting w/o sanitize_callback" "$file:$lineno" "$content"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "register_setting[[:space:]]*\(" 2>/dev/null || true)
+fi
+
+# 24. XXE — XML parsing without entity-loader hardening (BC-37 / AP-057).
+# PHP 8.0+ disables external entity loading by default; pre-8.0 plugins or
+# code that explicitly enables entities are at risk. Detection: per-file,
+# check whether the file uses XML parsing AND does NOT call
+# libxml_disable_entity_loader(true). MEDIUM by default — auditor confirms
+# whether the parser receives attacker-controlled XML.
+if [ -n "$PHP_FILES" ]; then
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        # Skip if file disables entity loading anywhere
+        if grep -qE -e "libxml_disable_entity_loader[[:space:]]*\([[:space:]]*true" "$file" 2>/dev/null; then
+            continue
+        fi
+        # Skip if LIBXML_NOENT is NOT set AND LIBXML_NONET is set (defensive option flags)
+        # We don't try to parse all variants — just emit MEDIUM and let auditor verify.
+        add_finding MEDIUM "XML parsing w/o entity-loader disable (XXE candidate)" "$file:$lineno" "$content"
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "(^|[^[:alnum:]_>])(new[[:space:]]+SimpleXMLElement|DOMDocument::loadXML|simplexml_load_(string|file)|xml_parser_create)" 2>/dev/null || true)
+fi
+
+# 25. Predictable randomness near security context (BC-57 / AP-055).
+# mt_rand / rand / uniqid within 5 lines (above or below) of one of:
+#   token, nonce, reset, password, secret, csrf, key, hash, session
+# Each fire is a candidate; rand() for non-security purposes (e.g. demo data)
+# is legitimate. Auditor confirms whether the random feeds a security primitive.
+if [ -n "$PHP_FILES" ]; then
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        # Skip the rand-method definition collision
+        echo "$content" | grep -qE -e "function[[:space:]]+(mt_rand|uniqid)[[:space:]]*\(" && continue
+        # Context window: 5 lines above, 5 below
+        start=$((lineno - 5)); [ $start -lt 1 ] && start=1
+        end=$((lineno + 5))
+        ctx=$(sed -n "${start},${end}p" "$file" 2>/dev/null)
+        if echo "$ctx" | grep -qiE -e '\b(token|nonce|reset|password|secret|csrf|session|hash|salt|api_key)\b'; then
+            add_finding MEDIUM "weak random (mt_rand/uniqid) near security context" "$file:$lineno" "$content"
+        fi
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "(^|[^[:alnum:]_>])(mt_rand|uniqid)[[:space:]]*\(" 2>/dev/null || true)
+fi
+
+# 26. Hardcoded encryption material (BC-56 / BC-58 / AP-054).
+# openssl_encrypt / openssl_decrypt with a literal string in the key/iv
+# position. Heuristic: if the call line contains a quoted base64-looking
+# string of length ≥ 16 chars, flag it.
+# Calibration: legitimate hardcoded constants (e.g. AES method name 'aes-256-cbc')
+# are excluded by the length floor.
+scan_pattern_php MEDIUM "openssl_(en|de)crypt w/ hardcoded literal material" \
+    "openssl_(en|de)crypt[[:space:]]*\([^)]*['\"][A-Za-z0-9+/=]{16,}['\"]"
+
+# 27. JWT 'none' algorithm (BC-43).
+# `'alg' => 'none'` or `"alg":"none"` in PHP/JSON config — JWT verification
+# accepts the 'none' algorithm. CVE-2015-9235-style flaw.
+scan_pattern_php HIGH "JWT 'none' algorithm" \
+    "['\"]alg['\"][[:space:]]*(=>|:)[[:space:]]*['\"]none['\"]"
+
+# 28. Privilege escalation — 1-hop trace for Rule 14b/14c.
+# Rule 14b/14c only fired on direct superglobal: `->set_role($_POST['role'])`.
+# This rule extends to: variable assigned from superglobal in the same
+# function, then passed to set_role/add_cap/wp_set_auth_cookie/wp_set_current_user.
+# Same per-function span tracing pattern as Rule 11b.
+if [ -n "$PHP_FILES" ]; then
+    priv_sink_re='([a-zA-Z0-9_]->[[:space:]]*(set_role|add_cap|remove_cap)|wp_set_(current_user|auth_cookie))[[:space:]]*\([[:space:]]*\$([a-zA-Z_][a-zA-Z0-9_]+)'
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        file="${match%%:*}"; rest="${match#*:}"
+        lineno="${rest%%:*}"; content="${rest#*:}"
+        case "$lineno" in ''|*[!0-9]*) continue ;; esac
+        is_comment_line "$content" && continue
+        # Skip if direct-superglobal form already caught by Rule 14
+        if echo "$content" | grep -qE -e '\$_(GET|POST|REQUEST)'; then continue; fi
+
+        # Extract the variable name
+        var=$(echo "$content" | grep -oE -e "$priv_sink_re" | head -1 \
+              | sed -E 's/.*\$([a-zA-Z_][a-zA-Z0-9_]+).*/\1/')
+        [ -z "$var" ] && continue
+
+        # Find enclosing function span
+        _populate_file_cache "$file"
+        func_start=0; func_end=0
+        while IFS= read -r rec; do
+            [ -z "$rec" ] && continue
+            IFS='|' read -r _tag _s _e _ _ _ <<< "$rec"
+            if [ "$lineno" -ge "$_s" ] && [ "$lineno" -le "$_e" ]; then
+                func_start="$_s"; func_end="$_e"
+                break
+            fi
+        done <<< "${FILE_FUNC_DATA[$file]}"
+        [ "$func_start" = "0" ] && continue
+
+        body=$(sed -n "${func_start},${func_end}p" "$file" 2>/dev/null)
+        # 1-hop: $var = ... $_POST/$_GET/$_REQUEST ...
+        if echo "$body" | grep -qE -e "\\\$${var}[[:space:]]*=[^;]*\\\$_(GET|POST|REQUEST)"; then
+            add_finding HIGH "priv-esc sink <- superglobal (1-hop)" "$file:$lineno" "$content"
+        fi
+    done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE -e "$priv_sink_re" 2>/dev/null || true)
 fi
 
 echo

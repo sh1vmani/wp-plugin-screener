@@ -28,7 +28,7 @@ BLD=$'\033[1m'
 RST=$'\033[0m'
 
 LIMIT=200            # how many popular plugins to seed from wp.org
-MIN_INSTALLS=50000
+MIN_INSTALLS=100000   # hunt-workflow gate: >=100k floor (watchlist --slug bypasses)
 TOP_N=3              # how many to render in the top list (now: one per install bucket)
 DOWNLOAD_N=3         # how many to download + screen
 MIN_UPDATE_AGE_DAYS=30   # exclude plugins updated within the last N days (active patches)
@@ -116,7 +116,8 @@ USAGE:
 
 DISCOVERY OPTIONS:
   --limit N                Seed pool size (default 200; split across browse modes)
-  --min-installs N         Minimum active installs (default 50000)
+  --min-installs N         Minimum active installs (default 100000; hunt-workflow
+                           floor — watchlist --slug bypasses it)
   --min-update-age N       Skip plugins updated within N days (default 30)
   --slug X[,Y,Z]           Force-include specific slugs (bypasses install/update gates)
   --category TAG[,TAG2]    Bias seed pool by wp.org tag (forms,membership,crm,security,...)
@@ -465,7 +466,23 @@ _DEFAULT_WEIGHTS = {
     "f01_high":             12,
     "f01_med":               6,
     "f01_low":               2,
+    "pro_vendor":           -8,   # Wordfence-coordinated pro-vendor (comprehensive
+                                  # fixers — sibling-walk tends to come up dry; the
+                                  # F01-shape wins on indie/solo reactive-patch devs)
 }
+
+# Known Wordfence/Patchstack-coordinated "comprehensive fix" vendors. Matched
+# case-insensitively as substrings against the plugin's author + name. Override
+# the list with $WP_FINDER_PRO_VENDORS (comma-separated) to add/replace.
+_PRO_VENDORS = [s.strip().lower() for s in (
+    os.environ.get("WP_FINDER_PRO_VENDORS") or
+    "yith,w3 eden,wp rocket,rocketgenius,gravity forms,awesome motive,"
+    "wpforms,optinmonster,yoast,team yoast,caseproof,memberpress,stellarwp,"
+    "liquid web,sandhills,easy digital downloads,elementor,automattic,"
+    "really simple,rank math,wpml,onthego,ithemes,solidwp,solid security,"
+    "10up,xwp,modern tribe,saucal,sucuri,wordfence,kinsta,brainstorm force,"
+    "wpbeginner,syed balkhi"
+).split(",") if s.strip()]
 
 def _load_weights():
     w = dict(_DEFAULT_WEIGHTS)
@@ -508,6 +525,7 @@ elif cmd == "wporg_meta":
     out({
         "slug": j.get("slug"),
         "name": html.unescape(j.get("name") or ""),
+        "author": html.unescape(re.sub("<[^>]+>", "", j.get("author") or "")).strip()[:120],
         "active_installs": j.get("active_installs") or 0,
         "last_updated": (j.get("last_updated") or "")[:10],
         "version": j.get("version"),
@@ -902,6 +920,14 @@ elif cmd == "score":
     elif f01_l >= 3:
         w = W["f01_low"]; score += w
         reasons.append((_d(w), f"F01-shape: {f01_l} LOW-priority siblings (review)"))
+
+    # Vendor-profile gate (hunt-workflow step 2): deprioritize pro-vendors.
+    _vend = ((rec.get("author") or "") + " " + (rec.get("name") or "")).lower()
+    _hit = next((v for v in _PRO_VENDORS if v and v in _vend), None)
+    if _hit:
+        w = W["pro_vendor"]; score += w
+        reasons.append((_d(w), f"pro-vendor profile ({_hit}) — comprehensive-fixer, F01-shape low-yield"))
+    rec["pro_vendor_match"] = _hit
 
     rec["cves_dedup"]        = cves
     rec["cves_recent_count"] = n_12mo

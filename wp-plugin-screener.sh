@@ -294,7 +294,12 @@ if [ "$EXCLUDE_VENDORED" = "1" ]; then
     # *-sdk / *-lib / *-client / php-* pattern OR a LICENSE file is present)
     # is treated as a vendored library and excluded. Plugin's own top-level
     # composer.json is NOT considered (it's the plugin's manifest, not a vendor).
-    AUTO_VENDOR_DIRS=$(find "$TARGET_DIR" -mindepth 2 -maxdepth 4 -type f -name 'composer.json' 2>/dev/null | \
+    # maxdepth 7 (was 4): deeply-nested bundled SDKs (e.g.
+    # lib/amazon/guzzle/guzzle/composer.json, lib/amazon/aws/aws-sdk-php/
+    # composer.json) sit at depth 5+, so a maxdepth-4 scan never pruned them
+    # and their unserialize()/sink lines inflated findings (FP-class fix
+    # 2026-05-15). mindepth 2 still protects the plugin's own root manifest.
+    AUTO_VENDOR_DIRS=$(find "$TARGET_DIR" -mindepth 2 -maxdepth 7 -type f -name 'composer.json' 2>/dev/null | \
         while read -r cj; do
             d=$(dirname "$cj")
             # Skip already-excluded canonical paths
@@ -341,6 +346,55 @@ if [ "$EXCLUDE_VENDORED" = "1" ]; then
                   -not -path "'*/lib/oauth/*'" \
                   -not -path "'*/lib/ICalEasyReader/*'" \
                   -not -path "'*/lib/composer/*'" \
+                  -not -path "'*/lib/Google/*'" \
+                  -not -path "'*/lib/Google2/*'" \
+                  -not -path "'*/Google/Auth/*'" \
+                  -not -path "'*/Google/Cache/*'" \
+                  -not -path "'*/Google/Client.php'" \
+                  -not -path "'*/lib/Dropbox/*'" \
+                  -not -path "'*/lib/Dropbox2/*'" \
+                  -not -path "'*/guzzle/*'" \
+                  -not -path "'*/GuzzleHttp/*'" \
+                  -not -path "'*/aws-sdk-php/*'" \
+                  -not -path "'*/aws/aws-sdk-php/*'" \
+                  -not -path "'*/lib/amazon/*'" \
+                  -not -path "'*/lib/amazon_s3_bwd_comp/*'" \
+                  -not -path "'*/phpseclib/*'" \
+                  -not -path "'*/Symfony/Component/*'" \
+                  -not -path "'*/symfony/*'" \
+                  -not -path "'*/Monolog/*'" \
+                  -not -path "'*/Psr/*'" \
+                  -not -path "'*/league/*'" \
+                  -not -path "'*/Carbon/*'" \
+                  -not -path "'*/Dompdf/*'" \
+                  -not -path "'*/dompdf/*'" \
+                  -not -path "'*/mpdf/*'" \
+                  -not -path "'*/tcpdf/*'" \
+                  -not -path "'*/tecnickcom/*'" \
+                  -not -path "'*/fpdf/*'" \
+                  -not -path "'*/HTMLPurifier/*'" \
+                  -not -path "'*/htmlpurifier/*'" \
+                  -not -path "'*/SimplePie/*'" \
+                  -not -path "'*/simplepie/*'" \
+                  -not -path "'*/swiftmailer/*'" \
+                  -not -path "'*/phpoffice/*'" \
+                  -not -path "'*/PHPExcel/*'" \
+                  -not -path "'*/firebase/*'" \
+                  -not -path "'*/Firebase/JWT/*'" \
+                  -not -path "'*/parsedown/*'" \
+                  -not -path "'*/Requests/src/*'" \
+                  -not -path "'*/stripe-php/*'" \
+                  -not -path "'*/setasign/*'" \
+                  -not -name 'pclzip.class.php' \
+                  -not -name 'class-pclzip.php' \
+                  -not -name 'simple_html_dom.php' \
+                  -not -name 'nusoap.php' \
+                  -not -name 'class.phpmailer.php' \
+                  -not -name 'class-phpmailer.php' \
+                  -not -name 'idna_convert.class.php' \
+                  -not -name 'jsmin.php' \
+                  -not -name 'class-simplepie.php' \
+                  -not -name 'Parsedown.php' \
                   $AUTO_VENDOR_PRUNE \
                   2>/dev/null)
     JS_FILES=$(find "$TARGET_DIR" -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.vue' \) \

@@ -54,7 +54,11 @@ done
 
 PYBIN="$(command -v python3.12 || command -v python3.11 || command -v python3)"
 SCREENER="/mnt/d/wp-security-audit-toolkit/wp-security-audit-toolkit/wp-plugin-screener.sh"
-INTEL="$HOME/.cache/wp-target-finder/wordfence-by-slug.json"
+# Unified intel resolver (B0) owns locating + freshness-guarding the WF dump.
+# Net-new tolerates a missing dump (swarm count just degrades to 0), so do
+# NOT hard-exit if absent — `|| true` keeps the graceful path under set -e.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/wp-intel.sh"
+INTEL="$(intel::wf_index || true)"
 AUDITED="$HOME/wp-audited-list.txt"
 CACHE="/tmp/.wp-screener-hunt"
 UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'

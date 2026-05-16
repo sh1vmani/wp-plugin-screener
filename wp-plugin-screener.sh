@@ -1053,6 +1053,20 @@ classify_auth_band() {
 
     # No cap, but has nonce / is_user_logged_in floor → SUBSCRIBER.
     if [ "$floor" = "1" ]; then
+        # FP-reduction 2026-05-15: a post-save handler (save_post / edit_post
+        # / wp_insert_post / pre_post_update / rest_after_insert_* / a
+        # add_meta_box save callback) is NOT generically Subscriber-reachable
+        # — its true gate is the target post type's edit capability, which
+        # for code-injection-type CPTs is admin-only. The screener cannot
+        # resolve which CPT, so SUBSCRIBER over-claims. Band UNKNOWN (honest:
+        # auditor verifies the CPT cap) instead of a false in-scope signal.
+        # Matches both registration idioms:
+        #   add_action('save_post', array($this,'fn'))  /  add_meta_box(...,'fn')
+        #   'save_post' => 'fn'  /  'save_post' => array($this,'fn')  (hook-map arrays)
+        local _ps_hooks='save_post|edit_post|wp_insert_post|pre_post_update|rest_after_insert[a-z_]*'
+        if [ -n "$func_name" ] && grep -qE "(add_action\([[:space:]]*['\"](${_ps_hooks})['\"][^)]*|['\"](${_ps_hooks})['\"][[:space:]]*=>[^,]*|add_meta_box\([^)]*|['\"]save_callback['\"][[:space:]]*=>[^,]*)[, (]['\"]?${func_name}\b" "$file" 2>/dev/null; then
+            echo "UNKNOWN"; return
+        fi
         echo "SUBSCRIBER"; return
     fi
 
@@ -1119,7 +1133,33 @@ if [ -n "$PHP_FILES" ]; then
         echo "$content" | grep -qE "function[[:space:]]+unserialize[[:space:]]*\(" && continue
         # Safe form: allowed_classes => false
         echo "$content" | grep -qE "allowed_classes['\"]?[[:space:]]*=>[[:space:]]*false" && continue
-        add_finding HIGH "unserialize()" "$file:$lineno" "$content"
+        # Source-trace (FP-reduction 2026-05-15): POI risk only when the
+        # deserialized value is ATTACKER-controlled. unserialize() of a
+        # TRUSTED store (get_option / *_meta / transient / $wpdb->get_* /
+        # wp_cache_get) is the dominant FP class (e.g. unserialize() of the
+        # core user_roles option). Downgrade trusted-source to LOW; keep
+        # attacker-source / unresolved at HIGH (conservative).
+        _src_re_trusted='get_option|get_site_option|get_network_option|get_transient|get_site_transient|get_post_meta|get_user_meta|get_term_meta|get_comment_meta|get_metadata|wp_cache_get|->get_var|->get_row|->get_col|->get_results'
+        _src_re_attacker='\$_(GET|POST|REQUEST|COOKIE|FILES)|php://input|file_get_contents'
+        _sev=HIGH
+        if echo "$content" | grep -qE "unserialize[[:space:]]*\([^)]*($_src_re_trusted)"; then
+            _sev=LOW
+        elif echo "$content" | grep -qE "unserialize[[:space:]]*\([^)]*($_src_re_attacker)"; then
+            _sev=HIGH
+        else
+            _uvar=$(echo "$content" | grep -oE 'unserialize[[:space:]]*\([[:space:]]*\$[A-Za-z_][A-Za-z0-9_]*' | grep -oE '\$[A-Za-z_][A-Za-z0-9_]*' | head -1)
+            if [ -n "$_uvar" ]; then
+                _nm="${_uvar#\$}"
+                _from=$(( lineno > 18 ? lineno - 18 : 1 ))
+                _asgn=$(sed -n "${_from},${lineno}p" "$file" 2>/dev/null | grep -E "\\\$${_nm}[[:space:]]*=[^=]" | tail -1)
+                if echo "$_asgn" | grep -qE "($_src_re_trusted)"; then
+                    _sev=LOW
+                elif echo "$_asgn" | grep -qE "($_src_re_attacker)"; then
+                    _sev=HIGH
+                fi
+            fi
+        fi
+        add_finding "$_sev" "unserialize() ($([ "$_sev" = LOW ] && echo 'trusted-source' || echo 'attacker/unresolved'))" "$file:$lineno" "$content"
     done < <(printf '%s\n' "$PHP_FILES" | xargs -d '\n' -r grep -HnE "(^|[^[:alnum:]_>])unserialize[[:space:]]*\(" 2>/dev/null || true)
 fi
 

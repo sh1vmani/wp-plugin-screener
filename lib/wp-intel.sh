@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# lib/wp-intel.sh — unified vuln-intel resolver (ROADMAP ★ B0).
+#
+# SOURCE THIS, don't exec it:   . "$(dirname "$0")/lib/wp-intel.sh"
+#
+# One abstraction over every free WP-vuln source. Consumers call intel::*
+# and never touch a raw source again. A provider registry + policy engine
+# picks the cheapest sufficient source per query and only escalates when a
+# free source was inconclusive (this is what "intelligently pick" means).
+#
+# PROVIDERS (this increment): wf_bulk (free-cached, PRIMARY for cve/advisory/
+# fixed_in — Wordfence Intelligence by-slug dump, already cached by the
+# finder; B0 only READS + age-guards it, never re-fetches a parallel copy),
+# and wporg (free, no quota — wp.org plugin metadata).
+#
+# Empirically corrected 2026-05-15: OSV.dev has NO WordPress ecosystem, so it
+# is NOT a slug→CVE provider (probe: "Invalid ecosystem"). WF-bulk already
+# carries per-advisory `patched_versions`, so it is the primary `fixed_in`
+# source and WPScan (B1, later) is only a rare quota cross-confirm — that is
+# the real WPScan-lock dissolution, not OSV.
+#
+# Public interface (stable):
+#   intel::cves       <slug>            -> JSON array of normalized records
+#   intel::fixed_in   <slug>            -> best/latest patched version (text)
+#   intel::advisories <slug>            -> TSV: version<TAB>type<TAB>title
+#   intel::meta       <slug>            -> JSON {active_installs,last_updated,author,version}
+#   intel::source_of  <slug> <qtype>    -> which provider answered (provenance)
+#   intel::wf_age_days                  -> staleness of the WF bulk cache
+#   intel::health                       -> one-line provider health summary
+# Query types for source_of: cves | advisories | fixed_in | meta
+#
+# Cache + provenance: $HOME/.cache/wp-intel/  (per-slug per-qtype, 24h TTL).
+
+# ---- config ----------------------------------------------------------------
+: "${WP_INTEL_WF_INDEX:=$HOME/.cache/wp-target-finder/wordfence-by-slug.json}"
+: "${WP_INTEL_CACHE:=$HOME/.cache/wp-intel}"
+: "${WP_INTEL_WF_STALE_DAYS:=10}"     # warn if WF bulk older than this
+: "${WP_INTEL_TTL:=86400}"            # per-query result cache TTL (24h)
+_INTEL_PYBIN="$(command -v python3.12 || command -v python3.11 || command -v python3)"
+mkdir -p "$WP_INTEL_CACHE" 2>/dev/null || true
+
+# Provenance is FILE-based (not an in-memory array): consumers call
+# resolvers via $(intel::fixed_in x) which runs in a subshell, so an
+# assoc array set inside would be lost. A sidecar .prov file survives.
+
+_intel_warn() { printf '[wp-intel] %s\n' "$*" >&2; }
+
+# ---- staleness / health ----------------------------------------------------
+intel::wf_age_days() {
+    [ -f "$WP_INTEL_WF_INDEX" ] || { echo -1; return; }
+    local mt now
+    mt=$(stat -c %Y "$WP_INTEL_WF_INDEX" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    echo $(( (now - mt) / 86400 ))
+}
+
+intel::health() {
+    local age; age=$(intel::wf_age_days)
+    if [ "$age" -lt 0 ]; then
+        echo "wf_bulk=MISSING ($WP_INTEL_WF_INDEX) — run wp-target-finder.sh once to populate"
+    elif [ "$age" -gt "$WP_INTEL_WF_STALE_DAYS" ]; then
+        echo "wf_bulk=STALE (${age}d > ${WP_INTEL_WF_STALE_DAYS}d) · wporg=ok — refresh the WF dump"
+    else
+        echo "wf_bulk=ok (${age}d) · wporg=ok"
+    fi
+}
+
+# ---- internal: cache helpers ----------------------------------------------
+_intel_cache_file() { echo "$WP_INTEL_CACHE/${1}.${2}"; }   # <slug> <qtype>
+_intel_cache_fresh() {
+    local f="$1"
+    [ -s "$f" ] || return 1
+    local mt now; mt=$(stat -c %Y "$f" 2>/dev/null || echo 0); now=$(date +%s)
+    [ $(( now - mt )) -lt "$WP_INTEL_TTL" ]
+}
+
+# ---- provider: wf_bulk (PRIMARY; free-cached) ------------------------------
+# Reads the existing Wordfence by-slug dump. Never fetches a parallel copy
+# (anti-dup constraint: the finder owns fetching; B0 owns reading + freshness).
+_intel_wf_query() {
+    # args: <slug> <qtype>   stdout: result   rc 0 ok / 1 no-data / 2 no-source
+    local slug="$1" qtype="$2"
+    [ -f "$WP_INTEL_WF_INDEX" ] || return 2
+    "$_INTEL_PYBIN" - "$WP_INTEL_WF_INDEX" "$slug" "$qtype" <<'PY'
+import sys, json, re
+idx, slug, qtype = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    d = json.load(open(idx))
+except Exception:
+    sys.exit(2)
+advs = d.get(slug) or []
+recs = []
+for a in advs:
+    if a.get("informational"):
+        continue
+    sw = (a.get("software") or [{}])[0]
+    pv = sw.get("patched_versions") or []
+    aff = sw.get("affected_versions") or {}
+    # derive a compact affected upper bound for display
+    ub = ""
+    for k, v in (aff.items() if isinstance(aff, dict) else []):
+        ub = v.get("to_version") or ub
+    t = a.get("title", "") or ""
+    recs.append({
+        "id": a.get("id", ""),
+        "title": t,
+        "published": (a.get("published", "") or "")[:10],
+        "type": (a.get("cwe", "") or "").strip() or "—",
+        "affected_to": ub,
+        "fixed_in": pv[0] if pv else "",
+        "patched": bool(sw.get("patched")),
+    })
+if not recs:
+    sys.exit(1)
+recs.sort(key=lambda r: r["published"], reverse=True)
+if qtype == "cves":
+    print(json.dumps(recs))
+elif qtype == "advisories":
+    for r in recs:
+        print(f"{r['affected_to'] or '?'}\t{r['type']}\t{r['title'][:140]}")
+elif qtype == "fixed_in":
+    # primary fixed_in = newest patched advisory's patched version
+    fx = next((r["fixed_in"] for r in recs if r["fixed_in"]), "")
+    if not fx:
+        sys.exit(1)
+    print(fx)
+else:
+    sys.exit(1)
+PY
+}
+
+# ---- provider: wporg (free, no quota) -------------------------------------
+_intel_wporg_meta() {
+    local slug="$1" body
+    body=$(curl -sS -m 15 -A 'Mozilla/5.0 (wp-intel)' \
+        "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request%5Bslug%5D=${slug}" 2>/dev/null) || return 2
+    printf '%s' "$body" | "$_INTEL_PYBIN" -c '
+import sys, json, re
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or d.get("error"):
+    sys.exit(1)
+print(json.dumps({
+    "active_installs": d.get("active_installs", 0) or 0,
+    "last_updated": (d.get("last_updated", "") or "")[:10],
+    "author": re.sub("<[^>]+>", "", d.get("author", "") or "").strip()[:80],
+    "version": d.get("version", ""),
+}))' || return 1
+}
+
+# ---- policy engine: ordered provider chain per query type -----------------
+# Returns the answer and records provenance. Short-circuits on first
+# confident (rc 0) provider. (WPScan/Patchstack/GHSA providers slot in here
+# at B1/B3/B5 with cost-class ordering; today: wf_bulk primary, wporg meta.)
+_intel_set_prov() { printf '%s' "$2" > "$(_intel_cache_file "$1" "$3").prov" 2>/dev/null || true; }
+_intel_resolve() {
+    local slug="$1" qtype="$2" cf out rc
+    cf=$(_intel_cache_file "$slug" "$qtype")
+    if _intel_cache_fresh "$cf"; then
+        _intel_set_prov "$slug" cache "$qtype"
+        cat "$cf"; return 0
+    fi
+    case "$qtype" in
+        cves|advisories|fixed_in)
+            out=$(_intel_wf_query "$slug" "$qtype"); rc=$?
+            if [ "$rc" = 0 ]; then
+                printf '%s' "$out" > "$cf"
+                _intel_set_prov "$slug" wf_bulk "$qtype"
+                printf '%s' "$out"; return 0
+            fi
+            # (B1 WPScan quota cross-confirm slots here when inconclusive)
+            _intel_set_prov "$slug" none "$qtype"
+            [ "$rc" = 2 ] && _intel_warn "wf_bulk unavailable ($(intel::health))"
+            return "$rc"
+            ;;
+        meta)
+            out=$(_intel_wporg_meta "$slug"); rc=$?
+            if [ "$rc" = 0 ]; then
+                printf '%s' "$out" > "$cf"
+                _intel_set_prov "$slug" wporg "$qtype"
+                printf '%s' "$out"; return 0
+            fi
+            _intel_set_prov "$slug" none "$qtype"; return "$rc"
+            ;;
+        *) _intel_warn "unknown query type: $qtype"; return 3 ;;
+    esac
+}
+
+# ---- public interface ------------------------------------------------------
+intel::cves()       { _intel_resolve "$1" cves; }
+intel::advisories() { _intel_resolve "$1" advisories; }
+intel::fixed_in()   { _intel_resolve "$1" fixed_in; }
+intel::meta()       { _intel_resolve "$1" meta; }
+intel::source_of()  { cat "$(_intel_cache_file "$1" "$2").prov" 2>/dev/null || echo unknown; }
+
+# If executed directly (not sourced): act as a CLI smoke harness.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    case "${1:-}" in
+        health) intel::health ;;
+        cves|advisories|fixed_in|meta)
+            q="$1"; shift; "intel::$q" "$1"
+            echo "  [provider: $(intel::source_of "$1" "$q")]" >&2 ;;
+        *) echo "usage: wp-intel.sh {health|cves|advisories|fixed_in|meta} [slug]" >&2; exit 1 ;;
+    esac
+fi

@@ -58,6 +58,7 @@ SCREENER="/mnt/d/wp-security-audit-toolkit/wp-security-audit-toolkit/wp-plugin-s
 # Net-new tolerates a missing dump (swarm count just degrades to 0), so do
 # NOT hard-exit if absent — `|| true` keeps the graceful path under set -e.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/wp-intel.sh"
+export WP_GATES_LIB="$(dirname "${BASH_SOURCE[0]}")/lib"   # shared gate spec (lib/wp_gates.py)
 INTEL="$(intel::wf_index || true)"
 AUDITED="$HOME/wp-audited-list.txt"
 CACHE="/tmp/.wp-screener-hunt"
@@ -77,16 +78,10 @@ for p in $(seq 1 "$PAGES"); do
 done
 "$PYBIN" - "$CACHE" "$PAGES" "$INTEL" "$AUDITED" "$MIN_INSTALLS" "$INCLUDE_PRO" > "$ULIST" <<'PY'
 import json, re, sys, os, datetime as dt
+sys.path.insert(0, os.environ["WP_GATES_LIB"]); import wp_gates  # shared gate spec
 cache, pages, intel_p, aud_p, min_inst, inc_pro = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6] == "1"
 today = dt.date.today()
-PRO = re.compile(r'yith|w3 ?eden|wp ?rocket|rocketgenius|gravity|awesome motive|'
-                 r'wpforms|optinmonster|yoast|caseproof|memberpress|stellarwp|'
-                 r'sandhills|elementor|automattic|really simple|rank ?math|wpml|'
-                 r'10up|brainstorm|wpdeveloper|wpmanageninja|smush|icegram|'
-                 r'themeisle|tidio|strangerstudios|servmask|boldgrid|hubspot|'
-                 r'wpbeginner|syed balkhi|liquid web|kinsta|aioseo|'
-                 r'all[ -]?in[ -]?one[ -]?seo|wp ?engine|nexcess|woocommerce|'
-                 r'wordpress\.org|rock lobster|litespeed', re.I)
+PRO = wp_gates.PRO_VENDOR_RE   # canonical (was the local superset; now shared)
 aud = set(x.strip() for x in open(aud_p) if x.strip())
 try:
     intel = json.load(open(intel_p))
@@ -94,12 +89,11 @@ except Exception:
     intel = {}
 yr = (today - dt.timedelta(days=365)).isoformat()
 
+# Recency POLICY shared (lib/wp_gates.py); LABELS stay local → byte-identical.
+_RLBL = {"pref": "2-6mo PREF", "ok": "1-2mo", "older": "6-12mo",
+         "last": "<1mo last", "neglected": ">12mo"}
 def recency(age):
-    if 60 <= age <= 180: return 10, "2-6mo PREF"
-    if 30 <= age <  60:  return 5,  "1-2mo"
-    if 180 < age <= 365: return 3,  "6-12mo"
-    if 0 <= age < 30:    return round(2*age/30.0), "<1mo last"
-    return 0, ">12mo"
+    return wp_gates.recency_points(age), _RLBL[wp_gates.recency_tier(age)]
 
 seen = set()
 for p in range(1, pages + 1):

@@ -171,6 +171,18 @@ try:
     txt = open(df, encoding="utf-8", errors="replace").read()
 except Exception:
     txt = ""
+# MODIFIED-files-only. A security signal in an ADDED file is NEW code that
+# correctly contains auth — NOT a silently-patched vuln (validated: ewww
+# 8.6.0 added classes/class-image-detective.php, a new feature with auth
+# from the start; A1 wrongly read it as a silent fix). Parse the "Changed
+# files" block (status M/A/D) and keep signals only from M files.
+mod = set()
+cf = txt.split("== Changed files ==")
+if len(cf) > 1:
+    for ln in cf[1].split("==", 1)[0].splitlines():
+        mm = re.match(r'^\s*M\s+(\S.*)$', ln)
+        if mm:
+            mod.add(mm.group(1).strip())
 seg = txt.split("== Security signals added in this diff ==")
 sig = seg[1].split("== Sibling-function")[0] if len(seg) > 1 else ""
 # HIGH = genuinely security-shaped SILENT-FIX signals only. Validated 2026-05-15:
@@ -193,7 +205,8 @@ for ln in sig.splitlines():
     if mf:
         path = mf.group(1)
         cur = f"{path} :: {mf.group(2)}"
-        cur_is_php = path.endswith(".php") and not NOISE.search(path)
+        cur_is_php = (path.endswith(".php") and not NOISE.search(path)
+                      and path in mod)   # MODIFIED file only — not new/added
         continue
     msg = re.match(r'^      \[(.+?)\]', ln)
     if msg and cur_is_php and HIGH.search("[" + msg.group(1)):

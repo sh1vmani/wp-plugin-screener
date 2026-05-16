@@ -173,7 +173,16 @@ except Exception:
     txt = ""
 seg = txt.split("== Security signals added in this diff ==")
 sig = seg[1].split("== Sibling-function")[0] if len(seg) > 1 else ""
-HIGH = re.compile(r'\[(auth:|cast:|typesafe:|sanitize: esc_like|smell: NEW loose-compare|removed: |crypto: hash_equals)', re.I)
+# HIGH = genuinely security-shaped SILENT-FIX signals only. Validated 2026-05-15:
+# bare `typesafe: ===`, `cast:`, and generic `removed: loose comparison` fire on
+# pure REFACTORS (limit-login-attempts-reloaded 3.2.2->3.2.3 was an
+# extract-method + ==/=== on trusted Config literals — zero vuln). Those are
+# NOT silent-patch signals. Kept: a silently-ADDED cap/nonce/permission_callback
+# (auth:), esc_like (silent LIKE-injection fix), hash_equals (silent timing/auth
+# fix), a NEW loose-compare on ATTACKER input (fresh bug), or a removed
+# __return_true (permission silently opened). Those mean "a security bug was
+# quietly fixed/created HERE".
+HIGH = re.compile(r'\[(auth:|sanitize: esc_like|smell: NEW loose-compare|crypto: hash_equals|removed: __return_true)', re.I)
 # First-party PHP only. Minified/build assets (.css/.js/.min.js/.map under
 # build/dist/assets) produce huge fake-signal counts (wordfence: 839 from
 # cache-busting CSS/JS). Same FP class fixed in the screener — apply here.

@@ -290,6 +290,23 @@ intel::fixed_in()   { _intel_resolve "$1" fixed_in; }
 intel::meta()       { _intel_resolve "$1" meta; }
 intel::source_of()  { cat "$(_intel_cache_file "$1" "$2").prov" 2>/dev/null || echo unknown; }
 
+# intel::wf_index — for BULK consumers (whole-index discovery scans, e.g.
+# wp-cve-hunt). The resolver owns locating + freshness-guarding the WF dump;
+# the consumer owns its own filtering. Prints the validated path to stdout,
+# emits a staleness/missing warning to stderr. rc 2 if the dump is absent.
+# This is the absorb boundary: consumers must NOT hardcode the cache path.
+intel::wf_index() {
+    if [ ! -f "$WP_INTEL_WF_INDEX" ]; then
+        _intel_warn "WF intel dump missing ($WP_INTEL_WF_INDEX) — run wp-target-finder.sh once to populate"
+        return 2
+    fi
+    local age; age=$(intel::wf_age_days)
+    if [ "$age" -gt "$WP_INTEL_WF_STALE_DAYS" ]; then
+        _intel_warn "WF intel dump is STALE (${age}d > ${WP_INTEL_WF_STALE_DAYS}d) — results may miss recent advisories; refresh recommended"
+    fi
+    printf '%s\n' "$WP_INTEL_WF_INDEX"
+}
+
 # If executed directly (not sourced): act as a CLI smoke harness.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     case "${1:-}" in

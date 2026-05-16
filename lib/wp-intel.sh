@@ -36,6 +36,12 @@
 : "${WP_INTEL_CACHE:=$HOME/.cache/wp-intel}"
 : "${WP_INTEL_WF_STALE_DAYS:=10}"     # warn if WF bulk older than this
 : "${WP_INTEL_TTL:=86400}"            # per-query result cache TTL (24h)
+# B1 — WPScan key pool (QUOTA cross-confirm; reached only when wf_bulk is
+# inconclusive). Keys from $WPSCAN_API_TOKENS (comma-sep), or $WPSCAN_API_TOKEN
+# (single, back-compat), or ~/.config/wp-finder/wpscan-keys (one per line).
+: "${WP_INTEL_WPSCAN_KEYFILE:=$HOME/.config/wp-finder/wpscan-keys}"
+: "${WP_INTEL_WPSCAN_COOLDOWN:=86400}"   # per-key cooldown on 429/exhaustion
+_INTEL_WPSCAN_STATE="$WP_INTEL_CACHE/wpscan-keys.state"   # key<TAB>cooling_until
 _INTEL_PYBIN="$(command -v python3.12 || command -v python3.11 || command -v python3)"
 mkdir -p "$WP_INTEL_CACHE" 2>/dev/null || true
 
@@ -55,14 +61,14 @@ intel::wf_age_days() {
 }
 
 intel::health() {
-    local age; age=$(intel::wf_age_days)
-    if [ "$age" -lt 0 ]; then
-        echo "wf_bulk=MISSING ($WP_INTEL_WF_INDEX) — run wp-target-finder.sh once to populate"
-    elif [ "$age" -gt "$WP_INTEL_WF_STALE_DAYS" ]; then
-        echo "wf_bulk=STALE (${age}d > ${WP_INTEL_WF_STALE_DAYS}d) · wporg=ok — refresh the WF dump"
-    else
-        echo "wf_bulk=ok (${age}d) · wporg=ok"
-    fi
+    local age wf nkeys live=0 k
+    age=$(intel::wf_age_days)
+    if   [ "$age" -lt 0 ]; then wf="wf_bulk=MISSING (run wp-target-finder.sh once)"
+    elif [ "$age" -gt "$WP_INTEL_WF_STALE_DAYS" ]; then wf="wf_bulk=STALE(${age}d)"
+    else wf="wf_bulk=ok(${age}d)"; fi
+    nkeys=$(_intel_wpscan_keys | grep -c . || true)
+    while IFS= read -r k; do [ -z "$k" ] && continue; _intel_wpscan_cooling "$k" || live=$((live+1)); done < <(_intel_wpscan_keys)
+    echo "$wf · wporg=ok · wpscan=${live}/${nkeys} live key(s) (quota cross-confirm)"
 }
 
 # ---- internal: cache helpers ----------------------------------------------
@@ -150,6 +156,86 @@ print(json.dumps({
 }))' || return 1
 }
 
+# ---- provider: wpscan (B1; QUOTA, multi-key rotation, last-resort) --------
+# Pool resolution order: $WPSCAN_API_TOKENS, then $WPSCAN_API_TOKEN, then the
+# keyfile. Per-key cooldown ledger: a key that 429s / exhausts is parked for
+# WP_INTEL_WPSCAN_COOLDOWN; the resolver transparently advances to the next
+# live key and only hard-fails (rc 2) when EVERY key is cooling/absent — so
+# the free chain always still answers; WPScan never blocks a hunt.
+_intel_wpscan_keys() {
+    local raw=""
+    [ -n "${WPSCAN_API_TOKENS:-}" ] && raw="$WPSCAN_API_TOKENS"
+    [ -z "$raw" ] && [ -n "${WPSCAN_API_TOKEN:-}" ] && raw="$WPSCAN_API_TOKEN"
+    if [ -z "$raw" ] && [ -f "$WP_INTEL_WPSCAN_KEYFILE" ]; then
+        raw=$(grep -vE '^\s*($|#)' "$WP_INTEL_WPSCAN_KEYFILE" | tr '\n' ',')
+    fi
+    printf '%s' "$raw" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$'
+}
+_intel_wpscan_cooling() {            # rc 0 = key is currently cooling
+    local key="$1" until now
+    [ -f "$_INTEL_WPSCAN_STATE" ] || return 1
+    until=$(awk -F'\t' -v k="$key" '$1==k{print $2}' "$_INTEL_WPSCAN_STATE" | tail -1)
+    [ -z "$until" ] && return 1
+    now=$(date +%s); [ "$now" -lt "$until" ]
+}
+_intel_wpscan_park() {               # mark key cooling
+    local key="$1" until; until=$(( $(date +%s) + WP_INTEL_WPSCAN_COOLDOWN ))
+    grep -vE "^${key}	" "$_INTEL_WPSCAN_STATE" 2>/dev/null > "$_INTEL_WPSCAN_STATE.tmp" || true
+    printf '%s\t%s\n' "$key" "$until" >> "$_INTEL_WPSCAN_STATE.tmp"
+    mv "$_INTEL_WPSCAN_STATE.tmp" "$_INTEL_WPSCAN_STATE" 2>/dev/null || true
+}
+_intel_wpscan_query() {              # <slug> <qtype>  rc 0 ok / 1 no-data / 2 no-live-key
+    local slug="$1" qtype="$2" key code body live=0
+    while IFS= read -r key; do
+        [ -z "$key" ] && continue
+        live=1
+        _intel_wpscan_cooling "$key" && continue
+        body=$(curl -sS -m 20 -H "Authorization: Token token=${key}" \
+               -w '\n%{http_code}' "https://wpscan.com/api/v3/plugins/${slug}" 2>/dev/null) || { _intel_wpscan_park "$key"; continue; }
+        code="${body##*$'\n'}"; body="${body%$'\n'*}"
+        if [ "$code" = "429" ] || printf '%s' "$body" | grep -qiE 'rate limit|exceeded|too many request'; then
+            _intel_warn "wpscan key …${key: -6} exhausted/429 → parked ${WP_INTEL_WPSCAN_COOLDOWN}s, advancing"
+            _intel_wpscan_park "$key"; continue
+        fi
+        [ "$code" = "200" ] || { _intel_wpscan_park "$key"; continue; }
+        printf '%s' "$body" | "$_INTEL_PYBIN" - "$slug" "$qtype" <<'PY'
+import sys, json
+slug, qtype = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+vs = (d.get(slug) or {}).get("vulnerabilities") or []
+recs = []
+for v in vs:
+    recs.append({
+        "id": (v.get("references", {}) or {}).get("cve", [""])[0] if isinstance(v.get("references", {}).get("cve"), list) else "",
+        "title": v.get("title", ""),
+        "published": (v.get("published_date", "") or "")[:10],
+        "type": v.get("vuln_type", "—"),
+        "fixed_in": v.get("fixed_in") or "",
+        "affected_to": "",
+        "patched": bool(v.get("fixed_in")),
+    })
+if not recs:
+    sys.exit(1)
+recs.sort(key=lambda r: r["published"], reverse=True)
+if qtype == "cves":
+    print(json.dumps(recs))
+elif qtype == "fixed_in":
+    fx = next((r["fixed_in"] for r in recs if r["fixed_in"]), "")
+    print(fx) if fx else sys.exit(1)
+elif qtype == "advisories":
+    for r in recs:
+        print(f"?\t{r['type']}\t{r['title'][:140]}")
+else:
+    sys.exit(1)
+PY
+        return $?      # answered (0) or no-data (1) from this live key
+    done < <(_intel_wpscan_keys)
+    [ "$live" = 1 ] && return 2 || return 2   # all cooling, or no keys → no-source
+}
+
 # ---- policy engine: ordered provider chain per query type -----------------
 # Returns the answer and records provenance. Short-circuits on first
 # confident (rc 0) provider. (WPScan/Patchstack/GHSA providers slot in here
@@ -164,15 +250,24 @@ _intel_resolve() {
     fi
     case "$qtype" in
         cves|advisories|fixed_in)
+            # Tier 1: wf_bulk (free-cached, PRIMARY).
             out=$(_intel_wf_query "$slug" "$qtype"); rc=$?
             if [ "$rc" = 0 ]; then
                 printf '%s' "$out" > "$cf"
                 _intel_set_prov "$slug" wf_bulk "$qtype"
                 printf '%s' "$out"; return 0
             fi
-            # (B1 WPScan quota cross-confirm slots here when inconclusive)
-            _intel_set_prov "$slug" none "$qtype"
             [ "$rc" = 2 ] && _intel_warn "wf_bulk unavailable ($(intel::health))"
+            # Tier 2: WPScan (QUOTA cross-confirm) — only reached because
+            # wf_bulk had no data / was unavailable. Multi-key rotation;
+            # silently skipped if no live key (free chain already tried).
+            out=$(_intel_wpscan_query "$slug" "$qtype"); rc=$?
+            if [ "$rc" = 0 ]; then
+                printf '%s' "$out" > "$cf"
+                _intel_set_prov "$slug" wpscan "$qtype"
+                printf '%s' "$out"; return 0
+            fi
+            _intel_set_prov "$slug" none "$qtype"
             return "$rc"
             ;;
         meta)
